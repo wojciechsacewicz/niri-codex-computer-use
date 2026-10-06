@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from isolation import network_namespace_args
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--niri', type=Path, required=True)
@@ -173,7 +174,7 @@ input {
         logs.append(log)
         # Hide host input devices even if a regression reaches foreground fallback.
         command = ['bwrap', '--die-with-parent', '--unshare-user', '--unshare-pid',
-                   '--unshare-ipc', '--unshare-net', '--ro-bind', '/', '/',
+                   '--unshare-ipc', *network_namespace_args(), '--ro-bind', '/', '/',
                    '--dev', '/dev', '--proc', '/proc',
                    '--bind', runtime.name, runtime.name,
                    '--bind', str(args.output), str(args.output),
@@ -307,7 +308,8 @@ input {
     assert subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True) == pointer_before
     assert subprocess.check_output(['wl-paste', '--no-newline'], env=env) == clipboard_before
     assert focused() == human['id']
-    result = dict(binary_sha256={'niri': hashlib.sha256(args.niri.read_bytes()).hexdigest(), 'codex-computer-use-linux': hashlib.sha256(args.backend.read_bytes()).hexdigest()}, test_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ['backend-mcp-check.py', 'gtk-slider-fixture.py']}, status='passed', backend_mcp=True, background_text=True, background_click=True, background_scroll=True, background_keys=True, background_drag=True, strict_rejections=True, strict_refusal_count=len(strict_cases), drag_start=20, drag_value=read_state('agent')['slider'], drag_motion=read_state('agent')['drag_motion'],
+    result = dict(binary_sha256={'niri': hashlib.sha256(args.niri.read_bytes()).hexdigest(), 'codex-computer-use-linux': hashlib.sha256(args.backend.read_bytes()).hexdigest()}, test_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ['backend-mcp-check.py', 'gtk-slider-fixture.py', 'isolation.py']}, status='passed', backend_mcp=True, background_text=True, background_click=True, background_scroll=True, background_keys=True, background_drag=True, strict_rejections=True, strict_refusal_count=len(strict_cases), drag_start=20, drag_value=read_state('agent')['slider'], drag_motion=read_state('agent')['drag_motion'],
+                  network_isolation='container-network-none' if os.environ.get('NCCU_TEST_NETWORK_NONE') == '1' else 'bubblewrap-net',
                   background_unicode=True, offscreen_input=True, focused_client_refused=True,
                   human_focus_unchanged=True, human_pointer_unchanged=True, clipboard_unchanged=True,
                   input_streams_isolated=True, screenshot=screenshot, windows=windows())

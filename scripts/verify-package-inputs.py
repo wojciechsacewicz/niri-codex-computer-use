@@ -16,7 +16,8 @@ for suite, fixture, binaries in [
         actual = hashlib.sha256((root / '.local/outputs' / name).read_bytes()).hexdigest()
         assert result['binary_sha256'][name] == actual, f'{name} changed since {suite} checks'
     script = 'nested-control.py' if suite == 'native' else 'backend-mcp-check.py'
-    for name in [script, fixture]:
+    dependencies = [script, fixture] + (['isolation.py'] if suite == 'backend' else [])
+    for name in dependencies:
         actual = hashlib.sha256((root / 'tests' / name).read_bytes()).hexdigest()
         assert result['test_sha256'][name] == actual, f'{name} changed since {suite} checks'
     assert (directory / 'agent-cursor-screen.png').is_file(), f'{suite} cursor evidence missing'
