@@ -6,7 +6,7 @@ This repository is a patch layer. It stores source pins, patches, tests, and pac
 
 `make check-updates` reports niri's latest stable release and development branch separately. It also reports the compositor patch project and community Codex builder's default HEAD. The command never edits pins or installs anything. JSON output is available with `python3 scripts/check-updates.py --json`. Network failures remain visible and return a nonzero status.
 
-Update one source pin at a time. Read the upstream changes, refresh patches, prepare fresh build trees, and run the native checks. Do not silently drop a patch to make a build pass. The daily GitHub workflow reports upstream revisions in its job summary. It does not publish issues, open PRs, or update users' machines.
+Update one source pin at a time. Read the upstream changes, refresh patches, prepare fresh build trees, and run the native checks. Do not silently drop a patch to make a build pass. Run `make check-updates` locally when reviewing upstream changes. This project has no GitHub CI, scheduled workflows, or Dependabot automation.
 
 We support reviewed stable niri releases. A new stable release may need patch changes before we can publish a compatible version. Development `main` is a compatibility target, not an automatic installation source. We cannot promise zero maintenance while niri's input changes remain outside upstream.
 
@@ -33,12 +33,12 @@ The companion updater handles our compositor, strict helper, session launcher, a
 
 1. Increment `packaging/arch/release.json` and the local `PKGBUILD` together. Update the changelog.
 2. Commit the reviewed integration, then run `make package-source`. The exported `PKGBUILD` and `.SRCINFO` point to that exact project commit. Publish the commit before sharing the recipe.
-3. Run the Arch source-build workflow. It builds the patched compositor and backend, runs isolated input/screenshot tests, and checks the package's actual launcher and source lock. PR jobs test their checkout through a temporary local source URL; the distributed recipe always uses the public repository. Cargo download/build caches are keyed by the source pins, patches, compiler, and installed package versions. Native checks still run on every build. Compilation uses an ordinary build container. Input tests run separately with Docker networking disabled and verified loopback-only interfaces, so CI does not need added network administration privileges. Normal laptop tests still create a private network namespace through bubblewrap.
+3. Build the exported recipe locally with `makepkg` as an ordinary user. It builds the patched compositor and backend, runs isolated input/screenshot tests, and packages only outputs matching passing evidence. Tests use private displays and bubblewrap namespaces, including a private network namespace. Do not bypass the checks or weaken system security to run them. Check the packaged launcher and source lock against the reviewed sources.
 4. For Codex integration changes, build a desktop candidate, run its SDK checks, and rebuild using the sources embedded in its actual package.
 5. Test a real login and native CUA with representative apps. Check focus, pointer, clipboard, screenshots, and the visible agent cursor. Record what passed and what remains unsupported.
 6. Publish a stable `vMAJOR.MINOR.PATCH` release only after those checks. Prereleases do not reach the companion updater.
 
-There is no stable release yet. The package and isolated tests do not establish real-login readiness. A maintainer must not publish a stable release from CI alone.
+There is no stable release yet. The package and isolated tests do not establish real-login readiness. A passing source build alone is not enough to publish a stable release.
 
 ## Diagnostics and rollback
 

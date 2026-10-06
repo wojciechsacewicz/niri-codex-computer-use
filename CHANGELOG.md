@@ -7,7 +7,8 @@
 - Share the package payload between developer builds and source builds.
 - Add GitHub stable-release updates and a user Topgrade drop-in.
 - Add read-only installation/session diagnostics and stable/development upstream reports.
-- Add a clean Arch source-build workflow with isolated background-input tests.
+- Verify local Arch source builds with isolated background-input tests.
+- Keep verification local; remove GitHub CI and scheduled repository automation.
 - Disable GCC LTO for C wrappers while retaining Cargo's Rust LTO.
 - Detect missing shared libraries after system updates.
 
