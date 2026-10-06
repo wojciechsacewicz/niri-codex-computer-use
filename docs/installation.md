@@ -39,6 +39,14 @@ The companion installs a separate compositor and strict background-only backend.
 
 For the generated `codex-desktop` package, save the currently installed package for rollback and close Codex and its active clients before running `pkexec pacman -U` with the reviewed package from `dist/`. Do not replace a running application's files during an active task.
 
+To install both reviewed packages together after closing active Codex clients, use:
+
+```sh
+NCCU_ROLLBACK_PACKAGE="$SAVED_CODEX_PACKAGE" bash scripts/finish-setup.sh
+```
+
+`$SAVED_CODEX_PACKAGE` must name a saved package with the same version as the currently installed Codex. The command refuses active clients. `--wait` waits for them to close without stopping them.
+
 Save your work, log out, and choose **Niri (Codex background control)** at the greeter. If your greeter runs a fixed command, select `niri-codex-session` explicitly in its configuration. Do not change or restart the greeter while work is running.
 
 After logging in, check `systemctl --user status niri-codex.service` and start Codex normally. Enable its native Computer Use feature and verify a harmless click and text entry in a separate disposable app. The first live desktop check remains required even after isolated tests pass.
