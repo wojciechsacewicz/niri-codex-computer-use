@@ -18,6 +18,7 @@ jobs:
           python3 -m py_compile scripts/*.py tests/*.py
           bash -n scripts/*.sh packaging/arch/niri-codex-session packaging/arch/niri-codex-computer-use
           git diff --check
+          python3 -m unittest discover -s tests -p 'test_*.py'
           make prepare
       - name: Check native adapter contracts
         working-directory: build/codex-desktop-linux

@@ -9,13 +9,27 @@ if [[ "${1:-}" != -l && -n "${SHELL:-}" ]] && [[ -x "$SHELL" ]] && grep -Fxq "$S
     exec "$SHELL" -l -c 'exec /usr/bin/niri-codex-session -l'
 fi
 export PATH="/usr/lib/niri-codex-computer-use/bin:$PATH"
-systemctl --user reset-failed niri-codex.service
+systemctl --user daemon-reload
+if [[ "$(systemctl --user show niri-codex.service --property=LoadState --value)" != loaded ]]; then
+    echo 'The niri-codex.service unit is unavailable. Reinstall the companion package before selecting this session.' >&2
+    exit 1
+fi
+# reset-failed rejects an inactive unit that systemd has already unloaded.
+if systemctl --user -q is-failed niri-codex.service; then
+    systemctl --user reset-failed niri-codex.service
+fi
 systemctl --user import-environment
 if command -v dbus-update-activation-environment >/dev/null; then
     dbus-update-activation-environment --all
 fi
 status=0
 systemctl --user --wait start niri-codex.service || status=$?
-systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target
-systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET
+systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target || {
+    echo 'Could not finish graphical session cleanup.' >&2
+    if [[ "$status" == 0 ]]; then status=1; fi
+}
+systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET || {
+    echo 'Could not clear the graphical session environment.' >&2
+    if [[ "$status" == 0 ]]; then status=1; fi
+}
 exit "$status"

@@ -29,6 +29,12 @@ This uses OpenAI's signed stable package index, builds an isolated candidate, ch
 
 The desktop package reuses an installed `codex-update-manager` binary. Set `NCCU_UPDATER` to a separately built updater if needed. Its local feature configuration defaults to computer use and Helium support. Additional features need their own compatibility checks.
 
+## Standalone source package
+
+After committing the integration, run `make package-source`. It exports a `PKGBUILD` and `.SRCINFO` for that exact commit into `dist/arch-source`. Publish the commit on GitHub before distributing the recipe. A clean source build does not depend on a maintainer's local binaries or an installed Codex app.
+
+Run `makepkg` in the exported directory as a normal user. It fetches the project commit, applies the pinned upstream patches, builds both binaries, runs the background-control tests, and packages only outputs matching the passing evidence. Install the declared build and test dependencies through your normal CachyOS package workflow first. Do not skip the checks.
+
 ## Install and activate
 
 ```sh
@@ -52,6 +58,34 @@ Save your work, log out, and choose **Niri (Codex background control)** at the g
 After logging in, check `systemctl --user status niri-codex.service` and start Codex normally. Enable its native Computer Use feature and verify a harmless click and text entry in a separate disposable app. The first live desktop check remains required even after isolated tests pass.
 
 The optional command `niri-codex-computer-use mcp` exposes the same strict backend over stdio MCP. Desktop CUA uses the native integration. A second manual computer-use MCP registration is not needed for that desktop path.
+
+## Diagnostics and Topgrade
+
+```sh
+niri-codex-computer-use doctor
+niri-codex-computer-use update --check
+niri-codex-computer-use setup-topgrade
+```
+
+The diagnostic distinguishes an installation failure from a correct installation awaiting activation. The updater uses stable releases from this GitHub project. The Topgrade command adds one user configuration drop-in and preserves your other settings. It never restarts your session. No stable release has been published yet.
+
+See [maintenance](maintenance-cachyos.md) for update dependencies, verification, and release policy.
+
+## Login returns to the greeter
+
+Companion revision `0.1.0-2` could exit before starting niri on a fresh user manager. The launcher called `reset-failed niri-codex.service` even when systemd had not loaded that unit. Systemd rejected it with `Unit niri-codex.service not loaded`, and the launcher exited. Revision `0.1.0-3` reloads unit definitions, checks that the unit exists, and resets it only when it is failed.
+
+The display manager starts the session as the authenticated user after PAM login. The launcher therefore uses the user's systemd manager. It must not start the compositor as root or as the greeter account.
+
+If login fails, return to the stock **Niri** session and check:
+
+```sh
+pacman -Q niri-codex-computer-use
+systemctl --user show niri-codex.service -p LoadState -p FragmentPath
+journalctl --user -b -u niri-codex.service
+```
+
+An empty service journal can mean the launcher exited before starting the compositor. Launcher regression tests run with a fake systemd manager and cover first login, failed-unit recovery, unavailable units, and refusing to touch a running session. They do not replace a real login test.
 
 ## Rollback
 

@@ -8,5 +8,7 @@ python3 "$NCCU_ROOT/scripts/verify-package-inputs.py"
 mkdir -p "$NCCU_ROOT/dist" "$NCCU_ROOT/.local/package"
 cp "$NCCU_ROOT/packaging/arch/PKGBUILD" "$NCCU_ROOT/.local/package/PKGBUILD"
 cd "$NCCU_ROOT/.local/package"
-NCCU_PROJECT_ROOT="$NCCU_ROOT" PKGDEST="$NCCU_ROOT/dist" makepkg --nodeps --force --noconfirm
-ln -sfn niri-codex-computer-use-0.1.0-2-x86_64.pkg.tar.zst "$NCCU_ROOT/dist/niri-codex-computer-use-latest.pkg.tar.zst"
+NCCU_PROJECT_ROOT="$NCCU_ROOT" PKGDEST="$NCCU_ROOT/dist" makepkg --force --noconfirm
+package_name="$(PKGDEST="$NCCU_ROOT/dist" makepkg --packagelist)"
+[[ -f "$package_name" ]] || { echo 'Expected companion package is missing' >&2; exit 1; }
+ln -sfn "$(basename "$package_name")" "$NCCU_ROOT/dist/niri-codex-computer-use-latest.pkg.tar.zst"

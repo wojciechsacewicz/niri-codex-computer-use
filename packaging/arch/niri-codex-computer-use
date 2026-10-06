@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+case "${1:-}" in
+    doctor|check-updates)
+        script="$1"
+        shift
+        exec python3 "/usr/share/niri-codex-computer-use/scripts/$script.py" "$@"
+        ;;
+    update)
+        shift
+        exec python3 /usr/share/niri-codex-computer-use/scripts/release-update.py "$@"
+        ;;
+    setup-topgrade)
+        shift
+        [[ $# == 0 ]] || { echo 'setup-topgrade takes no arguments' >&2; exit 2; }
+        exec python3 /usr/share/niri-codex-computer-use/scripts/setup-topgrade.py
+        ;;
+esac
 export NIRI_AGENT_LAUNCH=1
 export CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED=1
 export CODEX_COMPUTER_USE_NIRI_AGENT=1

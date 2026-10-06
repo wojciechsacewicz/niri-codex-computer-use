@@ -1,0 +1,30 @@
+name: Arch source build and background control
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: archlinux:base-devel
+      # The test backend creates its own unprivileged namespaces inside this container.
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    steps:
+      - name: Install build and isolated test dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust clang python nodejs niri cairo glib2 libinput libpipewire libxkbcommon mesa pango pixman seatd libdisplay-info libxrandr libxft xorg-server-xvfb xorg-xauth xdotool wtype wl-clipboard bubblewrap dbus gtk3 python-gobject python-pillow
+          useradd --create-home --uid 1000 builder
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and test as a normal user
+        env:
+          NCCU_JOBS: '2'
+        run: |
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash scripts/ci-arch.sh

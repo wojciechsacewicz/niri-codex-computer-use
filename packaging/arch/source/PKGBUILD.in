@@ -1,0 +1,39 @@
+# Exported from the selected project commit. No installed app or local build is needed.
+pkgname=niri-codex-computer-use
+pkgver=@PKGVER@
+pkgrel=@PKGREL@
+pkgdesc='Background Codex computer use on niri with a visible agent cursor'
+arch=('x86_64')
+url='https://github.com/wojciechsacewicz/niri-codex-computer-use'
+license=('MIT' 'GPL-3.0-or-later')
+depends=('niri' 'cairo' 'glib2' 'libinput' 'libpipewire' 'libxkbcommon' 'mesa' 'pango' 'pixman' 'seatd' 'systemd-libs' 'bash' 'python')
+makedepends=('git' 'rust' 'clang' 'pkgconf' 'libdisplay-info' 'libxrandr' 'libxft')
+checkdepends=('xorg-server-xvfb' 'xorg-xauth' 'xdotool' 'wtype' 'wl-clipboard' 'bubblewrap' 'dbus' 'gtk3' 'python-gobject' 'python-pillow')
+options=('!strip' '!debug')
+_project_revision='@PROJECT_REVISION@'
+source=("nccu::git+$url.git#commit=$_project_revision")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$srcdir/nccu"
+    python3 scripts/prepare-sources.py all
+}
+
+build() {
+    cd "$srcdir/nccu"
+    bash scripts/build.sh all
+}
+
+check() {
+    cd "$srcdir/nccu"
+    python3 -m unittest discover -s tests -p 'test_*.py'
+    bash scripts/test-native.sh
+    python3 scripts/verify-package-inputs.py
+}
+
+package() {
+    # Even --nocheck must not package binaries without passing native evidence.
+    python3 "$srcdir/nccu/scripts/verify-package-inputs.py"
+    source "$srcdir/nccu/packaging/arch/package-files.sh"
+    nccu_package_files "$srcdir/nccu" "$pkgdir"
+}

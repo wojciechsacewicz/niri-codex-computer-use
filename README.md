@@ -20,7 +20,9 @@ This is an early project. Our niri 26.04 build and Codex backend pass isolated G
 
 ![Human and agent test windows with a separate purple agent cursor](docs/images/background-cursor.png)
 
-The current Codex SDK checks and two successive update-source snapshots also pass. We have built separate CachyOS packages. Activation in a real login session and real app testing are still required before calling this ready for daily use.
+The current Codex SDK checks and two successive update-source snapshots also pass. We have built separate CachyOS packages. A first-login launcher bug was found and fixed. Activation in a real login session and real app testing are still required before calling this ready for daily use.
+
+The project stores patches and source pins, not a copy of niri. Source builds fetch the reviewed upstream revision into an ignored build directory. GitHub release updates and a Topgrade drop-in are provided. No stable release is published yet, so the updater leaves the installed version alone.
 
 See [installation](docs/installation.md) for build, test, activation, and rollback steps. See [maintenance](docs/maintenance-cachyos.md) for updates. The original NixOS files remain as reference material.
 
