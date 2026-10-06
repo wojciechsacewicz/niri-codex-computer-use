@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Niri (Codex background control)
+Comment=Niri with a separate visible agent cursor and background input
+Exec=niri-codex-session
+Type=Application
+DesktopNames=niri

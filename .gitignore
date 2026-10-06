@@ -1,2 +1,10 @@
 result
 result-*
+.local/
+build/
+dist/
+target/
+*.pkg.tar.*
+
+__pycache__/
+*.pyc

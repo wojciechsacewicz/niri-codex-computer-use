@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "upstream_patches": {
+    "repository": "https://github.com/lihaoze123/niri-computer-use",
+    "revision": "2e518b2d555936fe48e89efe43c8f7f2ef0225f9"
+  },
+  "niri": {
+    "repository": "https://github.com/niri-wm/niri",
+    "revision": "8ed0da44d974c32c6877d2f4630c314da0717ecb",
+    "version": "26.04"
+  },
+  "codex_desktop_linux": {
+    "repository": "https://github.com/ilysenko/codex-desktop-linux",
+    "revision": "219790e02a0f9a9775e558c790bf08eeb2d1c8f0"
+  }
+}

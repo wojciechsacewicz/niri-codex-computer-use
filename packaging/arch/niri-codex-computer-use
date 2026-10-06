@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export NIRI_AGENT_LAUNCH=1
+export CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED=1
+export CODEX_COMPUTER_USE_NIRI_AGENT=1
+exec /usr/lib/niri-codex-computer-use/bin/codex-computer-use-linux "$@"

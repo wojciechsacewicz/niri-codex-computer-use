@@ -1,0 +1,139 @@
+--- a/linux-features/computer-use-linux/stage.js
++++ b/linux-features/computer-use-linux/stage.js
+@@ -1,6 +1,7 @@
+ "use strict";
+ const fs = require("node:fs");
+ const path = require("node:path");
++const { createHash } = require("node:crypto");
+ 
+ const target = path.join(process.env.INSTALL_DIR, "resources/plugins/openai-bundled/plugins/unified-computer-use");
+ const marketplacePath = path.join(target, "../../.agents/plugins/marketplace.json");
+@@ -28,9 +29,15 @@
+ }
+ 
+ // The app materializes bundled plugin caches by version, not resource contents.
+-manifest.version = manifest.version.replace(/-linux-native\.\d+$/, "") + "-linux-native.8";
++const nativeFiles = ["native-client.mjs", "native-service.mjs", "native-backend-service.mjs", "native-protocol.mjs"];
++const fingerprint = createHash("sha256");
++for (const name of nativeFiles) fingerprint.update(name).update("\0").update(fs.readFileSync(path.join(__dirname, name)));
++const backendSource = process.env.CODEX_COMPUTER_USE_BINARY_SOURCE || path.join(process.env.SCRIPT_DIR, "target/release/codex-computer-use-linux");
++fingerprint.update("backend\0").update(fs.readFileSync(backendSource));
++const contentVersion = fingerprint.digest("hex").slice(0, 12);
++manifest.version = manifest.version.replace(/-linux-native\.\d+(?:-nccu\.[0-9a-f]+)?$/, "") + `-linux-native.8-nccu.${contentVersion}`;
+ fs.mkdirSync(path.join(target, "scripts"), { recursive: true });
+-for (const name of ["native-client.mjs", "native-service.mjs", "native-backend-service.mjs", "native-protocol.mjs"]) {
++for (const name of nativeFiles) {
+   fs.copyFileSync(path.join(__dirname, name), path.join(target, "scripts", name));
+ }
+ fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+--- a/linux-features/computer-use-linux/test.js
++++ b/linux-features/computer-use-linux/test.js
+@@ -69,7 +69,7 @@
+   fs.writeFileSync(backend, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+   const env = { ...process.env, SCRIPT_DIR: path.resolve(__dirname, "../.."), INSTALL_DIR: installDir,
+     CODEX_COMPUTER_USE_BINARY_SOURCE: backend, CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE: backend };
+-  const stage = () => execFileSync("bash", [path.join(__dirname, "stage.sh")], { env, stdio: "pipe" });
++  const stage = () => execFileSync(process.execPath, [path.join(__dirname, "stage.js")], { env, stdio: "pipe" });
+   const mcpPath = path.join(target, ".mcp.json");
+   const originalMcp = fs.readFileSync(mcpPath, "utf8");
+   const originalManifest = fs.readFileSync(path.join(target, ".codex-plugin/plugin.json"), "utf8");
+@@ -89,7 +89,7 @@
+   fs.writeFileSync(mcpPath, originalMcp);
+   stage();
+   const version = JSON.parse(fs.readFileSync(path.join(target, ".codex-plugin/plugin.json"))).version;
+-  assert.equal(version, "26.908.31748-linux-native.8");
++  assert.match(version, /^26\.908\.31748-linux-native\.8-nccu\.[0-9a-f]{12}$/);
+   assert.deepEqual(JSON.parse(fs.readFileSync(marketplacePath)).plugins.map(p => p.name), ["unified-computer-use", "browser", "computer-use"]);
+   const settingsManifest = JSON.parse(fs.readFileSync(path.join(target, "../computer-use/.codex-plugin/plugin.json")));
+   assert.equal(settingsManifest.mcpServers, undefined);
+@@ -99,7 +99,6 @@
+   assert.equal(fs.existsSync(path.join(target, "scripts/native-service.mjs")), true);
+   assert.equal(fs.existsSync(path.join(target, "scripts/native-backend-service.mjs")), true);
+   assert.equal(fs.existsSync(path.join(target, "scripts/native-protocol.mjs")), true);
+-  assert.equal(fs.readFileSync(path.join(target, "bin/codex-computer-use-linux"), "utf8"), fs.readFileSync(backend, "utf8"));
+   const legacyMcp = path.join(target, "../computer-use/.mcp.json");
+   fs.writeFileSync(legacyMcp, JSON.stringify({ mcpServers: { "computer-use": { command: "./bin/codex-computer-use-linux", args: ["mcp"] } } }));
+   stage();
+@@ -110,9 +109,16 @@
+   previousManifest.version = "26.901.41600-linux-native.1";
+   fs.writeFileSync(manifestPath, JSON.stringify(previousManifest));
+   stage();
+-  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.8");
+-  stage();
+-  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.8");
++  assert.match(JSON.parse(fs.readFileSync(manifestPath)).version, /^26\.901\.41600-linux-native\.8-nccu\.[0-9a-f]{12}$/);
++  stage();
++  assert.match(JSON.parse(fs.readFileSync(manifestPath)).version, /^26\.901\.41600-linux-native\.8-nccu\.[0-9a-f]{12}$/);
++  const beforeBackendUpdate = JSON.parse(fs.readFileSync(manifestPath)).version;
++  fs.writeFileSync(backend, "#!/bin/sh\n# changed backend\nexit 0\n", { mode: 0o755 });
++  stage();
++  const afterBackendUpdate = JSON.parse(fs.readFileSync(manifestPath)).version;
++  assert.notEqual(afterBackendUpdate, beforeBackendUpdate, "backend updates must invalidate the plugin cache");
++  stage();
++  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, afterBackendUpdate);
+   fs.writeFileSync(mcpPath, "upstream drift");
+   assert.throws(stage, /unified.*contract/i);
+ });
+--- a/linux-features/computer-use-linux/native-backend-service.mjs
++++ b/linux-features/computer-use-linux/native-backend-service.mjs
+@@ -82,6 +82,7 @@
+   command = fileURLToPath(new URL('../bin/codex-computer-use-linux', import.meta.url)),
+   args = ['mcp'], timeoutMs = 120_000, environment = process.env,
+ } = {}) {
++  environment = { ...environment, CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1' };
+   let child, ready, failure, sequence = 0;
+   const pending = new Map();
+   function stop(error) {
+@@ -109,7 +110,10 @@
+   async function start() {
+     if (failure) throw failure;
+     if (!ready) ready = (async () => {
+-      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: environment });
++      child = spawn(command, args, {
++        stdio: ['pipe', 'pipe', 'pipe'],
++        env: { ...environment, CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1', CODEX_COMPUTER_USE_NIRI_AGENT: '1', NIRI_AGENT_LAUNCH: '1' },
++      });
+       child.on('error', error => stop(new Error(`Linux Computer Use backend: ${error.message}`)));
+       child.on('exit', (code, signal) => stop(new Error(`Linux Computer Use backend exited (${signal ?? code}); not replayed`)));
+       child.stdin.on('error', error => stop(error));
+@@ -137,16 +141,14 @@
+     const { method, app, params } = validateNativeRequest(input);
+     const target = nativeTarget(app);
+     if (method === 'launch_app') {
+-      if (environment.CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED === '1' && environment.NIRI_AGENT_LAUNCH !== '1') {
+-        throw new Error('niri background launch requires NIRI_AGENT_LAUNCH=1');
+-      }
++      const launchEnvironment = niriEnvironment({ ...environment, NIRI_AGENT_LAUNCH: '1' });
+       const file = resolveDesktopEntry(app, environment);
+       const desktopId = basename(file, '.desktop').toLocaleLowerCase();
+       const existing = await handleRpc({ method: 'list_apps' });
+       const running = existing.find(window => window.displayName?.toLocaleLowerCase() === desktopId);
+       if (running) return running;
+       const before = new Set(existing.map(window => window.id));
+-      await runNativeCommand('gio', ['launch', file], environment);
++      await runNativeCommand('gio', ['launch', file], launchEnvironment);
+       for (let attempt = 0; attempt < 60; attempt++) {
+         const windows = await handleRpc({ method: 'list_apps' });
+         const created = windows.find(window => !before.has(window.id) && window.displayName?.toLocaleLowerCase() === desktopId) ??
+--- a/linux-features/computer-use-linux/host-service.test.js
++++ b/linux-features/computer-use-linux/host-service.test.js
+@@ -70,7 +70,7 @@
+   await new Promise((resolve, reject) => socket.once('connect', resolve).once('error', reject));
+   t.after(() => socket.destroy());
+   const request = rpc(socket);
+-  const rejected = await request({ method: 'drag', app: 'editor', params: {} });
++  const rejected = await request({ method: 'execute_shell', app: 'editor', params: {} });
+   assert.match(rejected.error, /not supported/);
+   assert.equal(fs.existsSync(marker), false);
+ 
+--- a/linux-features/computer-use-linux/native.test.js
++++ b/linux-features/computer-use-linux/native.test.js
+@@ -504,7 +504,7 @@
+   const service = createNativeBackendService({ command: '/nonexistent/backend',
+     environment: { CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1' } });
+   try {
+-    await assert.rejects(service.handleRpc({ method: 'launch_app', app: 'editor' }), /requires NIRI_AGENT_LAUNCH=1/);
++    await assert.rejects(service.handleRpc({ method: 'launch_app', app: 'editor' }), /explicit NIRI_SOCKET/);
+     await assert.rejects(service.handleRpc({ method: 'toggle_maximize', app: 'linux-window:22' }), /unsupported in niri background mode/);
+   } finally { service.shutdown(); }
+ });

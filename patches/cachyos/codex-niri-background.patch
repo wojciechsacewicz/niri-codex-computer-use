@@ -1,0 +1,1952 @@
+diff --git a/computer-use-linux/src/abs_pointer.rs b/computer-use-linux/src/abs_pointer.rs
+index 6129b0f..56b3eb3 100644
+--- a/computer-use-linux/src/abs_pointer.rs
++++ b/computer-use-linux/src/abs_pointer.rs
+@@ -117,8 +117,14 @@ impl AbsPointer {
+             return Err(self.release_after_error(code, error.into()));
+         }
+         sleep(Duration::from_millis(40));
+-        if let Err(error) = self.move_to(end.0, end.1) {
+-            return Err(self.release_after_error(code, error));
++        for point in interpolated_drag_points(start, end) {
++            if let Err(error) = self.move_to(point.0, point.1) {
++                return Err(self.release_after_error(code, error));
++            }
++            // GTK applications such as Inkscape require motion events after
++            // button-down to cross their drag threshold. A single jump from
++            // start to end can otherwise be treated as a click.
++            sleep(Duration::from_millis(10));
+         }
+         sleep(Duration::from_millis(40));
+         if let Err(error) = self.release_button(code) {
+@@ -143,6 +149,21 @@ impl AbsPointer {
+     }
+ }
+ 
++fn interpolated_drag_points(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
++    let dx = i64::from(end.0) - i64::from(start.0);
++    let dy = i64::from(end.1) - i64::from(start.1);
++    let distance = dx.abs().max(dy.abs());
++    let steps = ((distance + 31) / 32).clamp(2, 32);
++    (1..=steps)
++        .map(|step| {
++            (
++                (i64::from(start.0) + dx * step / steps) as i32,
++                (i64::from(start.1) + dy * step / steps) as i32,
++            )
++        })
++        .collect()
++}
++
+ /// Pointer buttons we can synthesize.
+ #[derive(Clone, Copy, Debug)]
+ pub enum PointerButton {
+@@ -168,3 +189,17 @@ impl PointerButton {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::interpolated_drag_points;
++
++    #[test]
++    fn drag_path_contains_intermediate_motion_and_exact_endpoint() {
++        let points = interpolated_drag_points((100, 200), (300, 500));
++
++        assert!(points.len() >= 2);
++        assert_ne!(points[0], (300, 500));
++        assert_eq!(points.last(), Some(&(300, 500)));
++    }
++}
+diff --git a/computer-use-linux/src/lib.rs b/computer-use-linux/src/lib.rs
+index 80068ce..b08ccf8 100644
+--- a/computer-use-linux/src/lib.rs
++++ b/computer-use-linux/src/lib.rs
+@@ -5,6 +5,7 @@ pub mod cosmic_helper;
+ pub mod diagnostics;
+ pub mod gnome_extension;
+ pub mod identity;
++pub mod niri_agent;
+ pub mod remote_desktop;
+ pub mod screenshot;
+ pub mod server;
+diff --git a/computer-use-linux/src/main.rs b/computer-use-linux/src/main.rs
+index a3e7c6a..9beb27a 100644
+--- a/computer-use-linux/src/main.rs
++++ b/computer-use-linux/src/main.rs
+@@ -12,6 +12,7 @@ mod cosmic_helper;
+ mod diagnostics;
+ mod gnome_extension;
+ mod identity;
++mod niri_agent;
+ mod remote_desktop;
+ mod screenshot;
+ mod server;
+diff --git a/computer-use-linux/src/screenshot.rs b/computer-use-linux/src/screenshot.rs
+index 92d33fc..dddf4eb 100644
+--- a/computer-use-linux/src/screenshot.rs
++++ b/computer-use-linux/src/screenshot.rs
+@@ -177,7 +177,76 @@ impl ScreenshotBackend {
+     }
+ }
+ 
++// Niri deliberately omits global coordinates for tiled windows. Capture the
++// exact window through compositor IPC instead of guessing a desktop crop.
++pub async fn capture_niri_window_raw(window_id: u64) -> Result<RawScreenshotCapture> {
++    if crate::niri_agent::supported() {
++        // No notification, no clipboard change, works for covered windows.
++        let directory = crate::niri_agent::tempfile_dir()?;
++        let path = directory.join("window.png");
++        let result = async {
++            crate::niri_agent::screenshot(window_id, &path).await?;
++            read_png_as_capture_inner(&path, "niri-agent-window")
++        }
++        .await;
++        let _ = fs::remove_file(&path);
++        let _ = fs::remove_dir(&directory);
++        return result;
++    }
++    crate::niri_agent::require_foreground_allowed()?;
++    use std::os::unix::fs::DirBuilderExt;
++    let mut nonce = [0u8; 16];
++    getrandom::fill(&mut nonce).map_err(|e| anyhow!("screenshot nonce: {e}"))?;
++    let name = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
++    let directory = std::env::temp_dir().join(format!("codex-niri-{name}"));
++    fs::DirBuilder::new().mode(0o700).create(&directory)?;
++    let path = directory.join("window.png");
++    let result = async {
++        let mut command = Command::new("niri");
++        command.args([
++            "msg",
++            "action",
++            "screenshot-window",
++            "--id",
++            &window_id.to_string(),
++            "--write-to-disk",
++            "true",
++            "--show-pointer",
++            "false",
++            "--path",
++        ]);
++        command.arg(&path);
++        let output = crate::command_runner::output(command, "capture Niri window").await?;
++        if !output.status.success() {
++            bail!(
++                "Niri window capture failed: {}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++        }
++        // IPC acknowledges before the compositor finishes encoding/writing PNG.
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
++        loop {
++            if let Ok(capture) = read_png_as_capture_inner(&path, "niri-window") {
++                if image::load_from_memory_with_format(&capture.bytes, image::ImageFormat::Png)
++                    .is_ok()
++                {
++                    return Ok(capture);
++                }
++            }
++            if tokio::time::Instant::now() >= deadline {
++                bail!("Niri did not write a complete window screenshot within 5 seconds");
++            }
++            tokio::time::sleep(Duration::from_millis(25)).await;
++        }
++    }
++    .await;
++    let _ = fs::remove_file(&path);
++    let _ = fs::remove_dir(&directory);
++    result
++}
++
+ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
++    crate::niri_agent::require_foreground_allowed()?;
+     hydrate_session_bus_env();
+ 
+     // Explicit override: use exactly the requested backend, no fallback. Lets
+diff --git a/computer-use-linux/src/server.rs b/computer-use-linux/src/server.rs
+index b972f65..a75b333 100644
+--- a/computer-use-linux/src/server.rs
++++ b/computer-use-linux/src/server.rs
+@@ -20,7 +20,7 @@ use crate::windowing::registry;
+ use crate::windows::{
+     focus_window_target, focused_window, list_windows, resolve_window_target,
+     window_permission_hint, WindowFocusResult, WindowInfo, WindowTarget,
+-    GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND, KWIN_BACKEND,
++    GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND, KWIN_BACKEND, NIRI_BACKEND,
+ };
+ use crate::ydotool;
+ use anyhow::Result;
+@@ -264,7 +264,12 @@ impl ComputerUseLinux {
+     ) -> Json<ActivateWindowOutput> {
+         let target = params.into_target();
+         let received = Some(serde_json::json!(target.clone()));
+-        match focus_window_target(&target).await {
++        match async {
++            crate::niri_agent::require_foreground_allowed()?;
++            focus_window_target(&target).await
++        }
++        .await
++        {
+             Ok(focus) => {
+                 let ok = focus_satisfies_target(&focus, &target);
+                 Json(ActivateWindowOutput {
+@@ -322,6 +327,18 @@ impl ComputerUseLinux {
+             .await;
+         let (screenshot, screenshot_error) = if include_screenshot {
+             let result: Result<ScreenshotCapture> = async {
++                if crate::niri_agent::background_only() {
++                    let window = window_context.as_ref()
++                        .filter(|window| crate::niri_agent::applies_to(window))
++                        .ok_or_else(|| anyhow::anyhow!("niri background screenshots require supported agent IPC and a niri target"))?;
++                    let raw = crate::screenshot::capture_niri_window_raw(window.window_id).await?;
++                    return prepare_screenshot_payload(raw, screenshot_options);
++                }
++                if let Some(window) = window_context.as_ref().filter(|w| w.backend == "niri") {
++                    ensure_readonly_screenshot_target_is_visible(window)?;
++                    let raw = crate::screenshot::capture_niri_window_raw(window.window_id).await?;
++                    return prepare_screenshot_payload(raw, screenshot_options);
++                }
+                 let raw = capture_screenshot_raw().await?;
+                 self.cache_desktop_size(raw.width, raw.height);
+                 if let Some(window) = window_context.as_ref() {
+@@ -450,6 +467,14 @@ impl ComputerUseLinux {
+         Parameters(params): Parameters<ScreenshotParams>,
+     ) -> Result<CallToolResult, ErrorData> {
+         let target = params.window_target();
++        if crate::niri_agent::background_only()
++            && (target.is_none() || params.full_screen == Some(true))
++        {
++            return Err(ErrorData::invalid_params(
++                "niri background screenshots require a window target and forbid full_screen",
++                None,
++            ));
++        }
+         let target_window = match target.as_ref() {
+             Some(target) => Some(
+                 self.resolve_screenshot_window(target, params.raise_window.unwrap_or(true))
+@@ -470,20 +495,30 @@ impl ComputerUseLinux {
+             .as_ref()
+             .and_then(|window| window.title.clone());
+ 
+-        let raw_capture = capture_screenshot_raw()
+-            .await
+-            .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
+-        self.cache_desktop_size(raw_capture.width, raw_capture.height);
++        let native_window = crop_window.filter(|window| window.backend == "niri");
++        let raw_capture = if let Some(window) = native_window {
++            crate::screenshot::capture_niri_window_raw(window.window_id).await
++        } else {
++            capture_screenshot_raw().await
++        }
++        .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
++        if native_window.is_none() {
++            self.cache_desktop_size(raw_capture.width, raw_capture.height);
++        }
+ 
+         // Warn when the target window extends past the visible desktop: the
+         // portal only captures on-screen pixels, so the crop silently loses the
+         // off-screen region while coordinate metadata still claims full size.
+-        let off_screen_note = match crop_window.and_then(|window| window.bounds.as_ref()) {
++        let off_screen_note = match crop_window
++            .filter(|_| native_window.is_none())
++            .and_then(|window| window.bounds.as_ref())
++        {
+             Some(bounds) => self.off_screen_note_for_bounds(bounds).await,
+             None => None,
+         };
+ 
+         let (capture, cropped) = match crop_window {
++            Some(_) if native_window.is_some() => (raw_capture, true),
+             Some(window) => {
+                 let (x, y, width, height) = self
+                     .window_crop_rect_for_capture(window, &raw_capture)
+@@ -597,6 +632,43 @@ impl ComputerUseLinux {
+     async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
+         let received = Some(serde_json::json!(params.clone()));
+         let mut input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
++        // niri agent input: deliver the click to the window's client without activating it or
++        // moving the user's pointer.
++        if params.relative == Some(true)
++            && params.element_index.is_none()
++            && params.role.is_none()
++            && params.name.is_none()
++            && params.text.is_none()
++            && params.states.is_empty()
++        {
++            if let (Some(x), Some(y), Some(window)) = (
++                params.x,
++                params.y,
++                self.niri_agent_window(params.window_target().as_ref())
++                    .await,
++            ) {
++                let count = params.click_count.unwrap_or(1).clamp(1, 10);
++                let button = params.button.clone();
++                let result = async {
++                    let window = window.map_err(anyhow::Error::msg)?;
++                    let (x, y) = crate::niri_agent::window_point(window.window_id, x, y).await?;
++                    let button = crate::niri_agent::button_code(button.as_deref())?;
++                    let mut events = vec![crate::niri_agent::motion(x, y)];
++                    for _ in 0..count {
++                        events.push(crate::niri_agent::button(button, true));
++                        events.push(crate::niri_agent::button(button, false));
++                    }
++                    crate::niri_agent::input(window.window_id, events).await
++                }
++                .await;
++                return niri_agent_output("click", result, received);
++            }
++        }
++
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("click", Err(error), received);
++        }
++
+         let mut portal_target_point = None;
+         // Raise the target window first (if specified) so the click lands on the
+         // intended app rather than whatever is stacked on top at that pixel.
+@@ -988,6 +1060,9 @@ impl ComputerUseLinux {
+         Parameters(params): Parameters<SetValueParams>,
+     ) -> Json<ActionOutput> {
+         let received = Some(serde_json::json!(params.clone()));
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("set_value", Err(error), received);
++        }
+         let object_ref = match self.resolve_object_ref(
+             params.element_index,
+             params.element_identifier.as_deref(),
+@@ -1044,6 +1119,61 @@ impl ComputerUseLinux {
+     async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+         let received = Some(serde_json::json!(params.clone()));
+         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
++        if params.relative == Some(true) || params.x.is_none() {
++            if let (true, Some(window)) = (
++                params.element_index.is_none(),
++                self.niri_agent_window(params.window_target().as_ref())
++                    .await,
++            ) {
++                let (px, py) = (params.x, params.y);
++                let direction = params.direction.to_ascii_lowercase();
++                let notches = (params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0)
++                    .round()
++                    .max(1.0);
++                let result = async {
++                    let window = window.map_err(anyhow::Error::msg)?;
++                    let (x, y) = match (px, py) {
++                        (Some(x), Some(y)) => {
++                            crate::niri_agent::window_point(window.window_id, x, y).await?
++                        }
++                        _ => {
++                            let bounds = window
++                                .bounds
++                                .as_ref()
++                                .ok_or_else(|| anyhow::anyhow!("window has no size"))?;
++                            (
++                                f64::from(bounds.width) / 2.0,
++                                f64::from(bounds.height) / 2.0,
++                            )
++                        }
++                    };
++                    // One wheel notch is 15 logical units in libinput/smithay.
++                    let amount = notches * 15.0;
++                    let (vertical, horizontal) = match direction.as_str() {
++                        "down" => (amount, 0.0),
++                        "up" => (-amount, 0.0),
++                        "right" => (0.0, amount),
++                        "left" => (0.0, -amount),
++                        other => anyhow::bail!("unsupported scroll direction {other:?}"),
++                    };
++                    crate::niri_agent::input(
++                        window.window_id,
++                        vec![
++                            crate::niri_agent::motion(x, y),
++                            crate::niri_agent::axis(vertical, horizontal),
++                        ],
++                    )
++                    .await
++                }
++                .await;
++                return niri_agent_output("scroll", result, received);
++            }
++        }
++
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("scroll", Err(error), received);
++        }
++
+         let mut portal_target_point = None;
+         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+         // Raise/focus the target window first (parity with click) so wheel
+@@ -1189,6 +1319,41 @@ impl ComputerUseLinux {
+             Some((x, y)) => self.off_screen_note_for_point(x, y).await,
+             None => None,
+         };
++        // ydotool's --absolute move is implemented with relative motion, so
++        // it misses its target on niri's mixed-scale displays. Put the cursor
++        // at the exact capture-space point with the same uinput device as
++        // click/drag, then send only wheel events through ydotool.
++        if self.is_niri_session() && target_point.is_some() && self.ensure_abs_pointer().await {
++            let (x, y) = target_point.expect("checked above");
++            let (dx, dy) = match direction {
++                ScrollDirection::Up => (0, units),
++                ScrollDirection::Down => (0, -units),
++                ScrollDirection::Left => (units, 0),
++                ScrollDirection::Right => (-units, 0),
++            };
++            let pointer = Arc::clone(&self.abs_pointer);
++            let wheel_args = wheel_mousemove_args(dx, dy);
++            let (guard, result) = run_cancellation_safe_input(input_guard, async move {
++                tokio::task::spawn_blocking(move || {
++                    let mut pointer = pointer.lock().map_err(|error| error.to_string())?;
++                    pointer
++                        .as_mut()
++                        .ok_or("absolute pointer unavailable".to_string())?
++                        .move_to(x, y)
++                        .map_err(|error| format!("{error:#}"))
++                })
++                .await
++                .map_err(|error| error.to_string())??;
++                sleep(Duration::from_millis(35)).await;
++                run_ydotool(&wheel_args).await.map(|output| vec![output])
++            })
++            .await;
++            let _guard = guard;
++            return Json(with_notes(
++                pointer_action_result(action_result("scroll", result, received)),
++                off_screen_note,
++            ));
++        }
+         if let Some(session) = self.cached_portal_pointer_session() {
+             let mapped_target = match (portal_target_point, target_point) {
+                 (Some(point), _) => Some(Some(point)),
+@@ -1346,9 +1511,110 @@ impl ComputerUseLinux {
+             open_world_hint = true
+         )
+     )]
+-    async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+-        let received = Some(serde_json::json!(params));
++    async fn drag(&self, Parameters(mut params): Parameters<DragParams>) -> Json<ActionOutput> {
++        let received = Some(serde_json::json!(params.clone()));
+         let mut input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
++        if params.relative == Some(true) {
++            if let Some(window) = self
++                .niri_agent_window(params.window_target().as_ref())
++                .await
++            {
++                let (sx, sy, ex, ey) = (params.start_x, params.start_y, params.end_x, params.end_y);
++                let result = async {
++                    let window = window.map_err(anyhow::Error::msg)?;
++                    let id = window.window_id;
++                    let (x0, y0) = crate::niri_agent::window_point(id, sx, sy).await?;
++                    let (x1, y1) = crate::niri_agent::window_point(id, ex, ey).await?;
++                    let left = crate::niri_agent::button_code(None)?;
++                    let mut events = vec![
++                        crate::niri_agent::motion(x0, y0),
++                        crate::niri_agent::button(left, true),
++                    ];
++                    // GTK only starts a drag after motion with the button held; interpolate.
++                    const STEPS: u32 = 20;
++                    for step in 1..=STEPS {
++                        let t = f64::from(step) / f64::from(STEPS);
++                        events.push(crate::niri_agent::motion(
++                            x0 + (x1 - x0) * t,
++                            y0 + (y1 - y0) * t,
++                        ));
++                    }
++                    events.push(crate::niri_agent::button(left, false));
++                    crate::niri_agent::input(id, events).await
++                }
++                .await;
++                return niri_agent_output("drag", result, received);
++            }
++        }
++
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("drag", Err(error), received);
++        }
++
++        let mut portal_target_points = None;
++        let window_target = params.window_target();
++        if params.relative == Some(true) && window_target.is_none() {
++            return Json(ActionOutput {
++                ok: false,
++                implemented: true,
++                action: "drag".to_string(),
++                message: "Relative coordinate drags require a window target.".to_string(),
++                received,
++            });
++        }
++        if let Some(target) = window_target {
++            let focus = match self.focus_target_for_input(&target).await {
++                Ok(focus) => focus,
++                Err(message) => {
++                    return Json(ActionOutput {
++                        ok: false,
++                        implemented: true,
++                        action: "drag".to_string(),
++                        message,
++                        received,
++                    });
++                }
++            };
++            tokio::time::sleep(Duration::from_millis(120)).await;
++            if params.relative == Some(true) {
++                let Some(focus) = focus.as_ref() else {
++                    return Json(ActionOutput {
++                        ok: false,
++                        implemented: true,
++                        action: "drag".to_string(),
++                        message: "Relative coordinate drags require verified target-window focus."
++                            .to_string(),
++                        received,
++                    });
++                };
++                let coordinate_map = match self.focused_window_coordinate_map(focus).await {
++                    Ok(mapping) => mapping,
++                    Err(message) => {
++                        return Json(ActionOutput {
++                            ok: false,
++                            implemented: true,
++                            action: "drag".to_string(),
++                            message,
++                            received,
++                        });
++                    }
++                };
++                if let Err(message) =
++                    apply_window_relative_drag_coordinates(&mut params, coordinate_map.capture_rect)
++                {
++                    return Json(ActionOutput {
++                        ok: false,
++                        implemented: true,
++                        action: "drag".to_string(),
++                        message,
++                        received,
++                    });
++                }
++                portal_target_points = coordinate_map
++                    .portal_point(params.start_x, params.start_y)
++                    .zip(coordinate_map.portal_point(params.end_x, params.end_y));
++            }
++        }
+         // Preferred backend: the uinput absolute pointer (accurate landing).
+         if self.ensure_abs_pointer().await {
+             let abs_pointer = Arc::clone(&self.abs_pointer);
+@@ -1405,17 +1671,10 @@ impl ComputerUseLinux {
+         }
+         if let Some(session) = self.cached_portal_pointer_session() {
+             let _ = self.capture_space_rect().await;
+-            let Some((start_x, start_y)) =
++            let Some(((start_x, start_y), (end_x, end_y))) = portal_target_points.or_else(|| {
+                 self.logical_portal_point(&session, params.start_x, params.start_y)
+-            else {
+-                self.clear_portal_pointer_session(&session);
+-                return Json(pointer_action_result(portal_coordinate_error(
+-                    "drag", received,
+-                )));
+-            };
+-            let Some((end_x, end_y)) =
+-                self.logical_portal_point(&session, params.end_x, params.end_y)
+-            else {
++                    .zip(self.logical_portal_point(&session, params.end_x, params.end_y))
++            }) else {
+                 self.clear_portal_pointer_session(&session);
+                 return Json(pointer_action_result(portal_coordinate_error(
+                     "drag", received,
+@@ -1451,16 +1710,15 @@ impl ComputerUseLinux {
+             let _ = self.capture_space_rect().await;
+             match self.ensure_portal_pointer_session().await {
+                 Ok(Some(session)) => {
+-                    let Some((start_x, start_y)) =
+-                        self.logical_portal_point(&session, params.start_x, params.start_y)
+-                    else {
+-                        self.clear_portal_pointer_session(&session);
+-                        return Json(pointer_action_result(portal_coordinate_error(
+-                            "drag", received,
+-                        )));
+-                    };
+-                    let Some((end_x, end_y)) =
+-                        self.logical_portal_point(&session, params.end_x, params.end_y)
++                    let Some(((start_x, start_y), (end_x, end_y))) =
++                        portal_target_points.or_else(|| {
++                            self.logical_portal_point(&session, params.start_x, params.start_y)
++                                .zip(self.logical_portal_point(
++                                    &session,
++                                    params.end_x,
++                                    params.end_y,
++                                ))
++                        })
+                     else {
+                         self.clear_portal_pointer_session(&session);
+                         return Json(pointer_action_result(portal_coordinate_error(
+@@ -1536,6 +1794,31 @@ impl ComputerUseLinux {
+         let received = Some(serde_json::json!(params.clone()));
+         let input_guard =
+             InputOperationGuard::new(Arc::clone(&self.input_operation_lock).lock_owned().await);
++        if let (Some((modifiers, keycode)), Some(window)) = (
++            key_chord(&params.key),
++            self.niri_agent_window(Some(&params.window_target())).await,
++        ) {
++            let result = async {
++                let window = window.map_err(anyhow::Error::msg)?;
++                let mut events = Vec::new();
++                for modifier in &modifiers {
++                    events.push(crate::niri_agent::key(*modifier, true));
++                }
++                events.push(crate::niri_agent::key(keycode, true));
++                events.push(crate::niri_agent::key(keycode, false));
++                for modifier in modifiers.iter().rev() {
++                    events.push(crate::niri_agent::key(*modifier, false));
++                }
++                crate::niri_agent::input(window.window_id, events).await
++            }
++            .await;
++            return niri_agent_output("press_key", result, received);
++        }
++
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("press_key", Err(error), received);
++        }
++
+         let focus = match self.focus_target_for_input(&params.window_target()).await {
+             Ok(focus) => focus,
+             Err(message) => {
+@@ -1685,6 +1968,27 @@ impl ComputerUseLinux {
+         let received = Some(serde_json::json!(params.clone()));
+         let mut input_guard =
+             InputOperationGuard::new(Arc::clone(&self.input_operation_lock).lock_owned().await);
++        if let Some(window) = self.niri_agent_window(Some(&params.window_target())).await {
++            let text = params.text.clone();
++            let result = async {
++                let window = window.map_err(anyhow::Error::msg)?;
++                // Chromium crashes when a temporary keymap delivers non-ASCII text into
++                // contenteditable (see docs/validation.md); use its Ctrl+Shift+U entry instead.
++                let ctrl_shift_u = chromium_browser_window(&window);
++                crate::niri_agent::input(
++                    window.window_id,
++                    vec![crate::niri_agent::text(&text, ctrl_shift_u)],
++                )
++                .await
++            }
++            .await;
++            return niri_agent_output("type_text", result, received);
++        }
++
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("type_text", Err(error), received);
++        }
++
+         let window_target = params.window_target();
+         let focus = match self.focus_target_for_input(&window_target).await {
+             Ok(focus) => focus,
+@@ -1698,6 +2002,47 @@ impl ComputerUseLinux {
+                 });
+             }
+         };
++        // ydotool type maps Unicode bytes to keycodes and can report success
++        // while inserting unrelated ASCII. niri supports virtual keyboards;
++        // wtype generates the keymap needed for literal non-ASCII input.
++        if self.is_niri_session() && !params.text.is_ascii() {
++            let text = params.text.clone();
++            let target_window = match focus.as_ref() {
++                Some(focused) => Some(focused.requested_window.clone()),
++                None => focused_window().await.ok().flatten(),
++            };
++            let Some(target_window) = target_window else {
++                return Json(action_result_with_focus(
++                    "type_text",
++                    Err("Cannot identify the focused niri window for non-ASCII input; no input was sent".to_string()),
++                    received,
++                    focus,
++                ));
++            };
++            let browser_unicode_hex = chromium_browser_window(&target_window);
++            let (guard, result) = run_cancellation_safe_input(input_guard, async move {
++                if browser_unicode_hex {
++                    run_chromium_unicode_hex_text(&text).await
++                } else {
++                    run_wtype_text(&text).await.map(|output| vec![output])
++                }
++            })
++            .await;
++            let _guard = guard;
++            let mut output = action_result_with_focus("type_text", result, received, focus.clone());
++            if output.ok {
++                output.message = if browser_unicode_hex {
++                    "Action sent through Chromium Unicode hex input.".to_string()
++                } else {
++                    "Action sent through niri virtual keyboard (wtype).".to_string()
++                };
++                if focus.is_some() {
++                    output =
++                        with_notes(output, self.input_landing_notes(focus.as_ref(), true).await);
++                }
++            }
++            return Json(output);
++        }
+         if self.should_prefer_kde_clipboard_text_backend() {
+             match self.ensure_portal_keyboard_session().await {
+                 Ok(Some(session)) => {
+@@ -2451,6 +2796,40 @@ struct DragParams {
+     start_y: i32,
+     end_x: i32,
+     end_y: i32,
++    #[serde(default)]
++    window_id: Option<u64>,
++    #[serde(default)]
++    app_id: Option<String>,
++    #[serde(default)]
++    wm_class: Option<String>,
++    #[serde(default, rename = "title")]
++    window_title: Option<String>,
++    /// Interpret both points relative to the targeted window's screenshot.
++    #[serde(default)]
++    relative: Option<bool>,
++}
++
++impl DragParams {
++    fn window_target(&self) -> Option<WindowTarget> {
++        if self.window_id.is_none()
++            && self.app_id.is_none()
++            && self.wm_class.is_none()
++            && self.window_title.is_none()
++        {
++            return None;
++        }
++        Some(WindowTarget {
++            window_id: self.window_id,
++            pid: None,
++            tty: None,
++            terminal_pid: None,
++            terminal_command: None,
++            terminal_cwd: None,
++            app_id: self.app_id.clone(),
++            wm_class: self.wm_class.clone(),
++            title: self.window_title.clone(),
++        })
++    }
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+@@ -2552,6 +2931,10 @@ impl ComputerUseLinux {
+         session_is_wayland(session_type.as_deref(), wayland_display.as_deref())
+     }
+ 
++    fn is_niri_session(&self) -> bool {
++        self.is_wayland_session() && env::var_os("NIRI_SOCKET").is_some()
++    }
++
+     // The Wayland remote-desktop portal is now a *fallback* for input: when a
+     // compatible ydotool CLI and working `ydotoold` socket are present we prefer
+     // ydotool, because it injects input without a permission prompt. GNOME
+@@ -2783,7 +3166,28 @@ impl ComputerUseLinux {
+         target: &WindowTarget,
+         raise_window: bool,
+     ) -> Result<WindowInfo> {
+-        let window = if raise_window {
++        if crate::niri_agent::background_only() {
++            return self
++                .niri_agent_window(Some(target))
++                .await
++                .ok_or_else(|| {
++                    anyhow::anyhow!(
++                        "niri background screenshots require supported agent IPC and a niri target"
++                    )
++                })?
++                .map_err(anyhow::Error::msg);
++        }
++        let agent_window = if raise_window && crate::niri_agent::supported() {
++            let windows = list_windows().await?;
++            let window = resolve_window_target(&windows, target)?.clone();
++            crate::niri_agent::applies_to(&window).then_some(window)
++        } else {
++            None
++        };
++        // niri agent screenshots render the window directly; no need to raise it.
++        let window = if let Some(window) = agent_window {
++            window
++        } else if raise_window {
+             let focus = focus_window_target(target).await?;
+             if !focus.exact_window_focused {
+                 anyhow::bail!(
+@@ -2881,6 +3285,16 @@ impl ComputerUseLinux {
+                         )
+                     })?,
+             ])
++        } else if window.backend == NIRI_BACKEND {
++            Some(
++                crate::windowing::backends::niri::monitor_layout()
++                    .await
++                    .map_err(|error| {
++                        anyhow::anyhow!(
++                            "Niri targeted input requires logical output geometry: {error:#}"
++                        )
++                    })?,
++            )
+         } else {
+             None
+         };
+@@ -2908,7 +3322,10 @@ impl ComputerUseLinux {
+             .unwrap_or(&focus.requested_window);
+         if !matches!(
+             window.backend.as_str(),
+-            GNOME_SHELL_EXTENSION_BACKEND | GNOME_SHELL_INTROSPECT_BACKEND | KWIN_BACKEND
++            GNOME_SHELL_EXTENSION_BACKEND
++                | GNOME_SHELL_INTROSPECT_BACKEND
++                | KWIN_BACKEND
++                | NIRI_BACKEND
+         ) {
+             let full_capture_rect = window
+                 .bounds
+@@ -2968,6 +3385,26 @@ impl ComputerUseLinux {
+         candidates.into_iter().next()
+     }
+ 
++    /// The niri window to drive with agent input, resolved without activating anything.
++    /// `None` when agent input does not apply (no target, other compositor, unpatched niri).
++    async fn niri_agent_window(
++        &self,
++        target: Option<&WindowTarget>,
++    ) -> Option<std::result::Result<WindowInfo, String>> {
++        let target = target.filter(|target| target.has_target())?;
++        if !crate::niri_agent::supported() {
++            return None;
++        }
++        let windows = match list_windows().await {
++            Ok(windows) => windows,
++            Err(error) => return Some(Err(format!("{error:#}"))),
++        };
++        match resolve_window_target(&windows, target) {
++            Ok(window) => crate::niri_agent::applies_to(window).then(|| Ok(window.clone())),
++            Err(error) => Some(Err(format!("{error:#}"))),
++        }
++    }
++
+     async fn focus_target_for_input(
+         &self,
+         target: &WindowTarget,
+@@ -3383,6 +3820,9 @@ impl ComputerUseLinux {
+         requested_action: Option<&str>,
+     ) -> Json<ActionOutput> {
+         let received = Some(serde_json::json!(params.clone()));
++        if let Err(error) = crate::niri_agent::require_foreground_allowed() {
++            return niri_agent_output("perform_action", Err(error), received);
++        }
+         let object_ref = match self.resolve_object_ref(
+             params.element_index,
+             params.element_identifier.as_deref(),
+@@ -3648,6 +4088,25 @@ fn describe_matching_nodes(nodes: &[&AccessibilityNode]) -> String {
+         .join("; ")
+ }
+ 
++fn niri_agent_output(
++    action: &str,
++    result: anyhow::Result<()>,
++    received: Option<serde_json::Value>,
++) -> Json<ActionOutput> {
++    Json(ActionOutput {
++        ok: result.is_ok(),
++        implemented: true,
++        action: action.to_string(),
++        message: match result {
++            Ok(()) => format!(
++                "Delivered {action} to the target window through niri agent input; the user's pointer, keyboard focus and active window were not changed."
++            ),
++            Err(error) => format!("niri agent input failed: {error:#}"),
++        },
++        received,
++    })
++}
++
+ fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
+     let button = button.unwrap_or("left");
+     let click_count = click_count.unwrap_or(1);
+@@ -4117,6 +4576,36 @@ fn apply_window_relative_click_coordinates(
+     Ok(())
+ }
+ 
++fn apply_window_relative_drag_coordinates(
++    params: &mut DragParams,
++    capture_rect: (i32, i32, u32, u32),
++) -> std::result::Result<(), String> {
++    let (origin_x, origin_y, width, height) = capture_rect;
++    if width == 0 || height == 0 {
++        return Err(
++            "Relative coordinate drags require non-empty target-window bounds.".to_string(),
++        );
++    }
++    let translate = |x: i32, y: i32| -> std::result::Result<(i32, i32), String> {
++        if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
++            return Err(
++                "Relative drag coordinates must be inside target-window bounds.".to_string(),
++            );
++        }
++        Ok((
++            origin_x
++                .checked_add(x)
++                .ok_or_else(|| "Relative drag x coordinate overflowed.".to_string())?,
++            origin_y
++                .checked_add(y)
++                .ok_or_else(|| "Relative drag y coordinate overflowed.".to_string())?,
++        ))
++    };
++    (params.start_x, params.start_y) = translate(params.start_x, params.start_y)?;
++    (params.end_x, params.end_y) = translate(params.end_x, params.end_y)?;
++    Ok(())
++}
++
+ /// Point a window-targeted scroll at the centre of the resolved window when
+ /// the caller supplied no coordinates. Without this the wheel events land on
+ /// whatever is under the current pointer position.
+@@ -4721,6 +5210,75 @@ async fn run_ydotool_type_text(text: &str) -> std::result::Result<Output, String
+     }
+ }
+ 
++async fn run_wtype_text(text: &str) -> std::result::Result<Output, String> {
++    let executable = option_env!("COMPUTER_USE_WTYPE_EXECUTABLE").unwrap_or("wtype");
++    let mut command = TokioCommand::new(executable);
++    // niri drops the first event while attaching a fresh virtual keyboard.
++    // A modifier tap primes it without inserting text or touching the clipboard.
++    command.args(["-P", "Shift_L", "-p", "Shift_L", "-s", "50", "--", text]);
++    let output = crate::command_runner::output_with_timeout(
++        command,
++        "run wtype",
++        ydotool_type_timeout(text),
++    )
++    .await
++    .map_err(|error| format!("{error:#}"))?;
++    if output.status.success() {
++        Ok(output)
++    } else {
++        Err(format!(
++            "wtype failed: {}",
++            String::from_utf8_lossy(&output.stderr)
++        ))
++    }
++}
++
++fn chromium_browser_window(window: &WindowInfo) -> bool {
++    [window.app_id.as_deref(), window.wm_class.as_deref()]
++        .into_iter()
++        .flatten()
++        .any(|identity| {
++            matches!(
++                identity.to_ascii_lowercase().as_str(),
++                "microsoft-edge"
++                    | "microsoft-edge-stable"
++                    | "google-chrome"
++                    | "google-chrome-stable"
++                    | "chromium"
++                    | "chromium-browser"
++                    | "brave-browser"
++                    | "vivaldi-stable"
++            )
++        })
++}
++
++async fn run_chromium_unicode_hex_text(text: &str) -> std::result::Result<Vec<Output>, String> {
++    let mut outputs = Vec::new();
++    let mut ascii = String::new();
++    for character in text.chars() {
++        if character.is_ascii() {
++            ascii.push(character);
++            continue;
++        }
++        if !ascii.is_empty() {
++            outputs.push(run_ydotool_type_text(&ascii).await?);
++            ascii.clear();
++        }
++        let begin = key_sequence("Ctrl+Shift+U").expect("supported Unicode hex chord");
++        outputs.push(run_ydotool(&ydotool_key_args(begin, true)).await?);
++        sleep(Duration::from_millis(35)).await;
++        outputs.push(run_ydotool_type_text(&format!("{:x}", character as u32)).await?);
++        sleep(Duration::from_millis(35)).await;
++        let commit = key_sequence("Space").expect("supported Unicode hex commit key");
++        outputs.push(run_ydotool(&ydotool_key_args(commit, false)).await?);
++        sleep(Duration::from_millis(35)).await;
++    }
++    if !ascii.is_empty() {
++        outputs.push(run_ydotool_type_text(&ascii).await?);
++    }
++    Ok(outputs)
++}
++
+ fn ydotool_type_timeout(text: &str) -> Duration {
+     let text_seconds = (text.chars().count() as u64).div_ceil(YDOTOOL_TYPE_CHARS_PER_SECOND);
+     Duration::from_secs(INPUT_COMMAND_TIMEOUT.as_secs().saturating_add(text_seconds))
+@@ -5429,6 +5987,259 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn niri_background_uses_targeted_ipc_and_never_replays_failed_input() {
++        use std::io::{BufRead, BufReader, Write};
++        use std::os::unix::net::UnixListener;
++        use std::sync::atomic::{AtomicBool, Ordering};
++
++        let dir = crate::niri_agent::tempfile_dir().unwrap();
++        let socket = dir.join("niri.sock");
++        let listener = UnixListener::bind(&socket).unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let done = Arc::new(AtomicBool::new(false));
++        let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
++        let thread_done = done.clone();
++        let thread_requests = requests.clone();
++        let responder = std::thread::spawn(move || {
++            while !thread_done.load(Ordering::Relaxed) {
++                let (mut stream, _) = match listener.accept() {
++                    Ok(connection) => connection,
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                        std::thread::sleep(Duration::from_millis(2));
++                        continue;
++                    }
++                    Err(error) => panic!("fixture accept: {error}"),
++                };
++                let mut line = String::new();
++                BufReader::new(stream.try_clone().unwrap())
++                    .read_line(&mut line)
++                    .unwrap();
++                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
++                thread_requests.lock().unwrap().push(request.clone());
++                let reply = if request["AgentInput"]["window_id"] == 0 {
++                    serde_json::json!({"Err": "no window with id 0"})
++                } else if request.get("AgentScreenshot").is_some() {
++                    image::RgbaImage::new(400, 300)
++                        .save(request["AgentScreenshot"]["path"].as_str().unwrap())
++                        .unwrap();
++                    serde_json::json!({"Ok": {"AgentScreenshot": {"scale": 2.0, "geometry_x": 10, "geometry_y": 20}}})
++                } else if request["AgentInput"]["events"][0]["Text"]["text"] == "fail once" {
++                    serde_json::json!({"Err": "input may already have arrived"})
++                } else {
++                    serde_json::json!({"Ok": "Handled"})
++                };
++                writeln!(stream, "{reply}").unwrap();
++            }
++        });
++        // Drop closes the fixture even if an assertion fails.
++        struct Responder {
++            done: Arc<AtomicBool>,
++            thread: Option<std::thread::JoinHandle<()>>,
++            dir: PathBuf,
++        }
++        impl Drop for Responder {
++            fn drop(&mut self) {
++                self.done.store(true, Ordering::Relaxed);
++                self.thread.take().unwrap().join().unwrap();
++                let _ = fs::remove_dir_all(&self.dir);
++            }
++        }
++        let _responder = Responder {
++            done,
++            thread: Some(responder),
++            dir: dir.clone(),
++        };
++        let niri = dir.join("niri");
++        fs::write(&niri, r##"#!/bin/sh
++case "$*" in
++  'msg --json windows') printf '%s\n' '[{"id":22,"title":"Covered editor","app_id":"editor","is_focused":false,"workspace_id":9,"layout":{"window_size":[200,150]}}]' ;;
++  'msg --json workspaces') printf '%s\n' '[]' ;;
++  'msg --json outputs') printf '%s\n' '{}' ;;
++  *) printf '%s\n' "$*" >> "$NIRI_TEST_UNEXPECTED"; exit 1 ;;
++esac
++"##).unwrap();
++        fs::set_permissions(&niri, fs::Permissions::from_mode(0o700)).unwrap();
++        let _path = EnvVarGuard::set("PATH", dir.to_str().unwrap());
++        let _unexpected = EnvVarGuard::set(
++            "NIRI_TEST_UNEXPECTED",
++            dir.join("unexpected").to_str().unwrap(),
++        );
++        let _socket = EnvVarGuard::set("NIRI_SOCKET", socket.to_str().unwrap());
++        let _agent = EnvVarGuard::set("CODEX_COMPUTER_USE_NIRI_AGENT", "1");
++        let _background = EnvVarGuard::set("CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED", "1");
++        let server = ComputerUseLinux::default();
++        let screenshot: ScreenshotParams =
++            serde_json::from_value(serde_json::json!({"window_id":22,"raise_window":false}))
++                .unwrap();
++        server.screenshot(Parameters(screenshot)).await.unwrap();
++        let click: ClickParams = serde_json::from_value(
++            serde_json::json!({"window_id":22,"x":110,"y":220,"relative":true}),
++        )
++        .unwrap();
++        assert!(server.click(Parameters(click)).await.0.ok);
++        let scroll: ScrollParams = serde_json::from_value(serde_json::json!({"window_id":22,"x":110,"y":220,"direction":"down","pages":1,"relative":true})).unwrap();
++        assert!(server.scroll(Parameters(scroll)).await.0.ok);
++        let drag: DragParams = serde_json::from_value(serde_json::json!({"window_id":22,"start_x":110,"start_y":220,"end_x":210,"end_y":260,"relative":true})).unwrap();
++        assert!(server.drag(Parameters(drag)).await.0.ok);
++        let key: PressKeyParams =
++            serde_json::from_value(serde_json::json!({"window_id":22,"key":"Ctrl+A"})).unwrap();
++        assert!(server.press_key(Parameters(key)).await.0.ok);
++        for (text, ok) in [("hello", true), ("fail once", false)] {
++            let text: TypeTextParams =
++                serde_json::from_value(serde_json::json!({"window_id":22,"text":text})).unwrap();
++            assert_eq!(server.type_text(Parameters(text)).await.0.ok, ok);
++        }
++        let before = requests.lock().unwrap().len();
++        let key: PressKeyParams = serde_json::from_value(
++            serde_json::json!({"window_id":22,"key":"DefinitelyUnknownKey"}),
++        )
++        .unwrap();
++        assert!(!server.press_key(Parameters(key)).await.0.ok);
++        assert!(
++            !server
++                .click(Parameters(ClickParams {
++                    element_index: Some(1),
++                    window_id: Some(22),
++                    relative: Some(true),
++                    ..Default::default()
++                }))
++                .await
++                .0
++                .ok
++        );
++        assert_eq!(requests.lock().unwrap().len(), before);
++        let recorded = requests.lock().unwrap();
++        let input: Vec<_> = recorded
++            .iter()
++            .filter_map(|request| request.get("AgentInput"))
++            .filter(|input| input["window_id"] != 0)
++            .collect();
++        assert_eq!(
++            input.len(),
++            6,
++            "six actions, no replay after ambiguous failure"
++        );
++        assert!(input.iter().all(|input| input["window_id"] == 22));
++        assert_eq!(
++            input[0]["events"][0],
++            crate::niri_agent::motion(50.0, 100.0)
++        );
++        assert_eq!(input[0]["events"].as_array().unwrap().len(), 3);
++        assert_eq!(input[1]["events"][1], crate::niri_agent::axis(75.0, 0.0));
++        assert_eq!(input[2]["events"].as_array().unwrap().len(), 23);
++        assert_eq!(
++            input[2]["events"][21],
++            crate::niri_agent::motion(100.0, 120.0)
++        );
++        assert_eq!(input[3]["events"].as_array().unwrap().len(), 4);
++        assert_eq!(
++            input[4]["events"][0],
++            crate::niri_agent::text("hello", false)
++        );
++        assert!(
++            !dir.join("unexpected").exists(),
++            "no focus, workspace or foreground screenshot commands"
++        );
++    }
++
++    // Run the environment-dependent backend suite with --test-threads=1.
++    #[tokio::test]
++    async fn niri_background_rejects_foreground_fallbacks_without_input() {
++        let _background = EnvVarGuard::set("CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED", "1");
++        let _agent = EnvVarGuard::set("CODEX_COMPUTER_USE_NIRI_AGENT", "0");
++        let server = ComputerUseLinux::default();
++        let click: ClickParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "x": 1, "y": 2, "relative": true
++        }))
++        .unwrap();
++        let scroll: ScrollParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "x": 1, "y": 2, "direction": "down", "relative": true
++        }))
++        .unwrap();
++        let drag: DragParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "relative": true
++        }))
++        .unwrap();
++        let key: PressKeyParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "key": "DefinitelyUnknownKey"
++        }))
++        .unwrap();
++        let text: TypeTextParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "text": "do not send"
++        }))
++        .unwrap();
++        for result in [
++            server.click(Parameters(click)).await,
++            server.scroll(Parameters(scroll)).await,
++            server.drag(Parameters(drag)).await,
++            server.press_key(Parameters(key)).await,
++            server.type_text(Parameters(text)).await,
++            server
++                .click(Parameters(ClickParams {
++                    element_index: Some(1),
++                    ..Default::default()
++                }))
++                .await,
++        ] {
++            assert!(!result.0.ok);
++            assert!(result.0.message.contains("foreground fallback refused"));
++        }
++        let screenshot: ScreenshotParams =
++            serde_json::from_value(serde_json::json!({ "window_id": 22 })).unwrap();
++        let error = server.screenshot(Parameters(screenshot)).await.unwrap_err();
++        assert!(error.message.contains("supported agent IPC"));
++        let untargeted: ScreenshotParams = serde_json::from_value(serde_json::json!({})).unwrap();
++        assert!(server
++            .screenshot(Parameters(untargeted))
++            .await
++            .unwrap_err()
++            .message
++            .contains("require a window target"));
++        let full_screen: ScreenshotParams = serde_json::from_value(serde_json::json!({
++            "window_id": 22, "full_screen": true
++        }))
++        .unwrap();
++        assert!(server
++            .screenshot(Parameters(full_screen))
++            .await
++            .unwrap_err()
++            .message
++            .contains("forbid full_screen"));
++        assert!(capture_screenshot_raw()
++            .await
++            .unwrap_err()
++            .to_string()
++            .contains("foreground fallback refused"));
++        let _enabled_agent = EnvVarGuard::set("CODEX_COMPUTER_USE_NIRI_AGENT", "1");
++        let _unavailable_socket =
++            EnvVarGuard::set("NIRI_SOCKET", "/nonexistent/niri-background-test.sock");
++        let key: PressKeyParams =
++            serde_json::from_value(serde_json::json!({ "window_id": 22, "key": "Ctrl+A" }))
++                .unwrap();
++        assert!(!server.press_key(Parameters(key)).await.0.ok);
++        let activation: ActivateWindowParams =
++            serde_json::from_value(serde_json::json!({ "window_id": 22 })).unwrap();
++        assert!(!server.activate_window(Parameters(activation)).await.0.ok);
++        assert!(
++            !server
++                .set_value(Parameters(SetValueParams {
++                    value: "x".into(),
++                    ..Default::default()
++                }))
++                .await
++                .0
++                .ok
++        );
++        assert!(
++            !server
++                .perform_action(Parameters(ActionParams::default()))
++                .await
++                .0
++                .ok
++        );
++    }
++
+     #[test]
+     fn avatar_cursor_socket_path_is_instance_scoped_and_bounded() {
+         assert_eq!(
+@@ -5953,6 +6764,48 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn relative_drag_coordinates_use_capture_space_rect() {
++        let mut params = DragParams {
++            start_x: 7,
++            start_y: 9,
++            end_x: 107,
++            end_y: 209,
++            window_id: Some(42),
++            app_id: None,
++            wm_class: None,
++            window_title: None,
++            relative: Some(true),
++        };
++
++        apply_window_relative_drag_coordinates(&mut params, (133, 267, 1067, 800)).unwrap();
++
++        assert_eq!((params.start_x, params.start_y), (140, 276));
++        assert_eq!((params.end_x, params.end_y), (240, 476));
++    }
++
++    #[test]
++    fn relative_drag_coordinates_must_keep_both_points_inside_bounds() {
++        for (start, end) in [((-1, 9), (107, 209)), ((7, 9), (800, 209))] {
++            let mut params = DragParams {
++                start_x: start.0,
++                start_y: start.1,
++                end_x: end.0,
++                end_y: end.1,
++                window_id: Some(42),
++                app_id: None,
++                wm_class: None,
++                window_title: None,
++                relative: Some(true),
++            };
++
++            let error = apply_window_relative_drag_coordinates(&mut params, (100, 200, 800, 600))
++                .unwrap_err();
++
++            assert!(error.contains("inside target-window bounds"));
++        }
++    }
++
+     #[test]
+     fn accessibility_filter_candidates_prefer_title_and_skip_synthetic_app_id() {
+         let window = window_info(
+diff --git a/computer-use-linux/src/windowing/backends/niri.rs b/computer-use-linux/src/windowing/backends/niri.rs
+index 0a4779b..08014ea 100644
+--- a/computer-use-linux/src/windowing/backends/niri.rs
++++ b/computer-use-linux/src/windowing/backends/niri.rs
+@@ -4,6 +4,7 @@ use crate::windowing::registry::BackendProbe;
+ use crate::windowing::types::{WindowBounds, WindowInfo};
+ use anyhow::{bail, Context, Result};
+ use serde::Deserialize;
++use std::collections::HashMap;
+ use std::process::Command as StdCommand;
+ use tokio::process::Command;
+ 
+@@ -60,7 +61,17 @@ pub async fn list_windows() -> Result<Vec<WindowInfo>> {
+         );
+     }
+ 
+-    parse_niri_windows(&String::from_utf8_lossy(&output.stdout))
++    let mut windows = parse_niri_windows(&String::from_utf8_lossy(&output.stdout))?;
++    if hydrate_window_origins(&mut windows).await.is_err() {
++        // Local workspace positions are unsafe without their output origins.
++        for window in &mut windows {
++            if let Some(bounds) = &mut window.bounds {
++                bounds.x = None;
++                bounds.y = None;
++            }
++        }
++    }
++    Ok(windows)
+ }
+ 
+ pub(crate) fn parse_niri_windows(json: &str) -> Result<Vec<WindowInfo>> {
+@@ -75,6 +86,84 @@ pub(crate) fn parse_niri_windows(json: &str) -> Result<Vec<WindowInfo>> {
+     Ok(windows)
+ }
+ 
++async fn hydrate_window_origins(windows: &mut [WindowInfo]) -> Result<()> {
++    let workspaces = niri_output_async(&["msg", "--json", "workspaces"])
++        .await
++        .context("failed to query Niri workspaces")?;
++    if !workspaces.status.success() {
++        bail!(
++            "niri workspaces query failed: {}",
++            command_failure_detail(&workspaces)
++        );
++    }
++    let workspaces: Vec<NiriWorkspace> =
++        serde_json::from_slice(&workspaces.stdout).context("failed to parse Niri workspaces")?;
++    let workspace_outputs = workspaces
++        .into_iter()
++        .filter_map(|workspace| {
++            let id = i32::try_from(workspace.id).ok()?;
++            Some((id, workspace.output?))
++        })
++        .collect::<HashMap<_, _>>();
++
++    let outputs = query_outputs().await?;
++    for window in windows {
++        let Some(workspace) = window.workspace else {
++            continue;
++        };
++        let Some(output_name) = workspace_outputs.get(&workspace) else {
++            continue;
++        };
++        let Some(output) = outputs.get(output_name) else {
++            continue;
++        };
++        let Some(logical) = output.logical.as_ref() else {
++            continue;
++        };
++        let Some(bounds) = window.bounds.as_mut() else {
++            continue;
++        };
++        if let (Some(x), Some(y)) = (bounds.x, bounds.y) {
++            bounds.x = x.checked_add(logical.x);
++            bounds.y = y.checked_add(logical.y);
++        }
++    }
++    Ok(())
++}
++
++pub async fn monitor_layout() -> Result<Vec<(i32, i32, i32, i32)>> {
++    let monitors = query_outputs()
++        .await?
++        .into_values()
++        .filter_map(|output| {
++            let logical = output.logical?;
++            (logical.width > 0 && logical.height > 0).then_some((
++                logical.x,
++                logical.y,
++                logical.width,
++                logical.height,
++            ))
++        })
++        .collect::<Vec<_>>();
++    if monitors.is_empty() {
++        bail!("Niri returned no usable logical outputs");
++    }
++    Ok(monitors)
++}
++
++async fn query_outputs() -> Result<HashMap<String, NiriOutput>> {
++    let output = niri_output_async(&["msg", "--json", "outputs"])
++        .await
++        .context("failed to query Niri outputs")?;
++    if !output.status.success() {
++        bail!(
++            "niri outputs query failed: {}",
++            command_failure_detail(&output)
++        );
++    }
++    serde_json::from_slice(&output.stdout).context("failed to parse Niri outputs")
++}
++
+ pub async fn activate_window(window_id: u64) -> Result<()> {
+     let args = niri_focus_args(window_id);
+     let output = niri_output_async(&args.iter().map(String::as_str).collect::<Vec<_>>())
+@@ -134,6 +223,33 @@ struct NiriWindow {
+ #[derive(Debug, Deserialize)]
+ struct NiriWindowLayout {
+     window_size: Option<[i64; 2]>,
++    tile_pos_in_workspace_view: Option<[f64; 2]>,
++    #[serde(default)]
++    window_offset_in_tile: [f64; 2],
++}
++
++#[derive(Debug, Deserialize)]
++struct NiriWorkspace {
++    id: u64,
++    output: Option<String>,
++}
++
++#[derive(Debug, Deserialize)]
++struct NiriOutput {
++    logical: Option<NiriLogicalOutput>,
++}
++
++#[derive(Debug, Deserialize)]
++struct NiriLogicalOutput {
++    x: i32,
++    y: i32,
++    width: i32,
++    height: i32,
++}
++
++fn finite_i32(value: f64) -> Option<i32> {
++    (value.is_finite() && value >= i32::MIN as f64 && value <= i32::MAX as f64)
++        .then_some(value.round() as i32)
+ }
+ 
+ impl From<NiriWindow> for WindowInfo {
+@@ -142,9 +258,13 @@ impl From<NiriWindow> for WindowInfo {
+             let [width, height] = layout.window_size?;
+             let width = u32::try_from(width).ok().filter(|value| *value > 0)?;
+             let height = u32::try_from(height).ok().filter(|value| *value > 0)?;
++            let position = layout.tile_pos_in_workspace_view.and_then(|[x, y]| {
++                let [offset_x, offset_y] = layout.window_offset_in_tile;
++                Some((finite_i32(x + offset_x)?, finite_i32(y + offset_y)?))
++            });
+             Some(WindowBounds {
+-                x: None,
+-                y: None,
++                x: position.map(|position| position.0),
++                y: position.map(|position| position.1),
+                 width,
+                 height,
+             })
+diff --git a/computer-use-linux/src/windowing/registry.rs b/computer-use-linux/src/windowing/registry.rs
+index bd057a9..2652620 100644
+--- a/computer-use-linux/src/windowing/registry.rs
++++ b/computer-use-linux/src/windowing/registry.rs
+@@ -141,6 +141,9 @@ pub fn backend_can_exact_focus(id: &str) -> bool {
+ }
+ 
+ pub async fn list_windows() -> Result<Vec<WindowInfo>> {
++    if crate::niri_agent::background_only() {
++        return niri::list_windows().await;
++    }
+     let mut errors = Vec::new();
+     for backend in BACKEND_ORDER {
+         if let Some(windows) =
+diff --git a/linux-features/computer-use-linux/native-backend-service.mjs b/linux-features/computer-use-linux/native-backend-service.mjs
+index f9a0f65..558dc21 100644
+--- a/linux-features/computer-use-linux/native-backend-service.mjs
++++ b/linux-features/computer-use-linux/native-backend-service.mjs
+@@ -1,8 +1,75 @@
+ import { spawn } from 'node:child_process';
++import { readFileSync, readdirSync, realpathSync } from 'node:fs';
++import { basename, join } from 'node:path';
+ import { createInterface } from 'node:readline';
+ import { fileURLToPath } from 'node:url';
+ import { nativeTarget, validateNativeRequest } from './native-protocol.mjs';
+ 
++// Only desktop entries advertised by the current session can be launched.
++// Never interpret an app id as a command, path, URL, or shell fragment.
++export function resolveDesktopEntry(app, environment = process.env) {
++  if (typeof app !== 'string' || !/^[\p{L}\p{N}_. -]+$/u.test(app) || app.startsWith('.') || app.includes('..')) {
++    throw new Error('Launch requires an installed desktop app id or display name');
++  }
++  const filename = app.endsWith('.desktop') ? app : `${app}.desktop`;
++  const dirs = [
++    join(environment.XDG_DATA_HOME || join(environment.HOME || '/nonexistent', '.local/share'), 'applications'),
++    ...(environment.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean).map(dir => join(dir, 'applications')),
++    '/run/current-system/sw/share/applications',
++    ...(environment.USER ? [join('/etc/profiles/per-user', environment.USER, 'share/applications')] : []),
++  ];
++  const matches = new Map();
++  for (const dir of dirs) {
++    let entries;
++    try { entries = readdirSync(dir).filter(name => name.endsWith('.desktop')); } catch { continue; }
++    for (const name of entries) {
++      const file = join(dir, name);
++      let contents;
++      try { contents = readFileSync(file, 'utf8'); } catch { continue; }
++      const desktop = contents.split(/^\[Desktop Entry\]\s*$/m)[1]?.split(/^\[/m)[0];
++      if (!desktop || !/^Type=Application\s*$/m.test(desktop) || !/^Exec=.+$/m.test(desktop) ||
++          /^Hidden=true\s*$/m.test(desktop) || /^NoDisplay=true\s*$/m.test(desktop)) continue;
++      if (name === filename) return file;
++      const displayName = desktop.match(/^Name=(.+)$/m)?.[1];
++      if (displayName?.toLocaleLowerCase() === app.toLocaleLowerCase()) matches.set(realpathSync(file), file);
++    }
++  }
++  if (matches.size === 1) return matches.values().next().value;
++  if (matches.size > 1) throw new Error(`Multiple desktop applications are named ${app}; use a desktop app id`);
++  throw new Error(`No installed desktop application matched ${app}`);
++}
++
++export function niriEnvironment(input = process.env) {
++  const environment = { ...input };
++  if (environment.NIRI_SOCKET && environment.WAYLAND_DISPLAY) return environment;
++  if (environment.CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED === '1') throw new Error('niri background mode requires explicit NIRI_SOCKET and WAYLAND_DISPLAY');
++  const runtime = environment.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`;
++  const sockets = readdirSync(runtime).filter(name => /^niri\.wayland-[\w-]+\.\d+\.sock$/.test(name));
++  if (sockets.length !== 1) throw new Error('Cannot uniquely identify the current niri session');
++  environment.XDG_RUNTIME_DIR = runtime;
++  environment.NIRI_SOCKET = join(runtime, sockets[0]);
++  environment.WAYLAND_DISPLAY = sockets[0].slice('niri.'.length).replace(/\.\d+\.sock$/, '');
++  environment.DBUS_SESSION_BUS_ADDRESS ||= `unix:path=${join(runtime, 'bus')}`;
++  return environment;
++}
++
++function runNativeCommand(command, args, environment) {
++  return new Promise((resolve, reject) => {
++    const child = spawn(command, args, {
++      stdio: ['ignore', 'ignore', 'pipe'], env: niriEnvironment(environment), detached: command === 'gio',
++    });
++    let diagnostic = '';
++    child.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk.toString()).slice(-2048); });
++    const timer = setTimeout(() => { child.kill(); reject(new Error(`${command} timed out`)); }, 10_000);
++    child.once('error', error => { clearTimeout(timer); reject(error); });
++    child.once('exit', (code, signal) => {
++      clearTimeout(timer);
++      if (code === 0) resolve();
++      else reject(new Error(`${command} failed (${signal ?? code}): ${diagnostic.trim()}`));
++    });
++  });
++}
++
+ function parseBackendJson(text) {
+   return JSON.parse(text, (key, value, context) =>
+     key === 'window_id' && typeof value === 'number' && !Number.isSafeInteger(value)
+@@ -13,7 +80,7 @@ function parseBackendJson(text) {
+ // are never retried because input may already have reached the desktop.
+ export function createNativeBackendService({
+   command = fileURLToPath(new URL('../bin/codex-computer-use-linux', import.meta.url)),
+-  args = ['mcp'], timeoutMs = 120_000,
++  args = ['mcp'], timeoutMs = 120_000, environment = process.env,
+ } = {}) {
+   let child, ready, failure, sequence = 0;
+   const pending = new Map();
+@@ -42,7 +109,7 @@ export function createNativeBackendService({
+   async function start() {
+     if (failure) throw failure;
+     if (!ready) ready = (async () => {
+-      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
++      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: environment });
+       child.on('error', error => stop(new Error(`Linux Computer Use backend: ${error.message}`)));
+       child.on('exit', (code, signal) => stop(new Error(`Linux Computer Use backend exited (${signal ?? code}); not replayed`)));
+       child.stdin.on('error', error => stop(error));
+@@ -69,6 +136,34 @@ export function createNativeBackendService({
+   async function handleRpc(input) {
+     const { method, app, params } = validateNativeRequest(input);
+     const target = nativeTarget(app);
++    if (method === 'launch_app') {
++      if (environment.CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED === '1' && environment.NIRI_AGENT_LAUNCH !== '1') {
++        throw new Error('niri background launch requires NIRI_AGENT_LAUNCH=1');
++      }
++      const file = resolveDesktopEntry(app, environment);
++      const desktopId = basename(file, '.desktop').toLocaleLowerCase();
++      const existing = await handleRpc({ method: 'list_apps' });
++      const running = existing.find(window => window.displayName?.toLocaleLowerCase() === desktopId);
++      if (running) return running;
++      const before = new Set(existing.map(window => window.id));
++      await runNativeCommand('gio', ['launch', file], environment);
++      for (let attempt = 0; attempt < 60; attempt++) {
++        const windows = await handleRpc({ method: 'list_apps' });
++        const created = windows.find(window => !before.has(window.id) && window.displayName?.toLocaleLowerCase() === desktopId) ??
++          windows.find(window => !before.has(window.id));
++        if (created) return created;
++        await new Promise(resolve => setTimeout(resolve, 150));
++      }
++      throw new Error(`Application started, but no new desktop window appeared for ${app}`);
++    }
++    if (method === 'toggle_maximize') {
++      if (environment.CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED === '1') throw new Error('toggleMaximize is unsupported in niri background mode');
++      const state = await handleRpc({ method: 'get_app_state', app, params: { include_screenshot: false } });
++      const id = state.window_context?.window_id;
++      if (id === undefined || !/^\d+$/.test(String(id))) throw new Error('No niri window id for maximize');
++      await runNativeCommand('niri', ['msg', 'action', 'maximize-window-to-edges', '--id', String(id)], environment);
++      return { ok: true, window_id: String(id) };
++    }
+     await start();
+     const result = await request('tools/call', { name: method === 'list_apps' ? 'list_windows' : method, arguments: { ...params, ...target } });
+     const message = result?.content?.filter(item => item.type === 'text').map(item => item.text).join('\n');
+diff --git a/linux-features/computer-use-linux/native-client.mjs b/linux-features/computer-use-linux/native-client.mjs
+index a4daae3..49fcd4e 100644
+--- a/linux-features/computer-use-linux/native-client.mjs
++++ b/linux-features/computer-use-linux/native-client.mjs
+@@ -57,6 +57,8 @@ export function installLinuxComputerUse(cua) {
+     return emit(apps.map((app, index) => ({ ...app, windows: [windows[index]] })), options);
+   };
+   cua.listWindows = async (options = {}) => emit(nativeWindows(await call('list_apps')), options);
++  cua.computer = { ...cua.computer,
++    launch_app: async ({ app }) => { await call('launch_app', app); } };
+   const linuxState = async (options = {}) => {
+     const state = browserState ? await browserState({ emit: false }) : { browsers: [] };
+     return emit({ ...state, apps: await cua.listApps({ emit: false }) }, options);
+@@ -121,8 +123,7 @@ export function installLinuxComputerUse(cua) {
+       getAXState: async (options = {}) => emit(axText(await state(options), options), options),
+       getScreenshot: async (options = {}) => screenshot(await call('screenshot', app, screenshotBackendOptions(options)), options),
+       getAXStateAndScreenshot: async (options = {}) => {
+-        // Capture raises the target first, so the passive AX observation sees
+-        // its resulting window state. Failed capture is reported, never retried.
++        // Observe AX after capture. Failed capture is reported, never retried.
+         let capture;
+         try { capture = await call('screenshot', app, screenshotBackendOptions(options)); }
+         catch (error) { capture = { screenshot_error: error.message }; }
+@@ -141,10 +142,26 @@ export function installLinuxComputerUse(cua) {
+         if (options.format && options.format !== 'text') return unsupported();
+         return call('type_text', app, { text });
+       },
+-      drag: unsupported, selectText: unsupported, setValue: unsupported, performSecondaryAction: unsupported,
++      drag: (from, to) => {
++        const start = point(from);
++        const end = point(to);
++        return call('drag', app, {
++          start_x: start.x, start_y: start.y,
++          end_x: end.x, end_y: end.y,
++          relative: true,
++        });
++      },
++      toggleMaximize: () => call('toggle_maximize', app),
++      selectText: unsupported, setValue: unsupported, performSecondaryAction: unsupported,
+     };
+-    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), pressKey(key), typeText(text), scroll([x,y], direction, {pixels} or legacy pages?), paste(text). Pixel distances are quantized to wheel steps by the backend. AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs bring the selected window forward and emit images themselves; getAXState() remains passive. Click/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, drag, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
+-    await target.getAXState();
++    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), drag([startX,startY], [endX,endY]), toggleMaximize(), pressKey(key), typeText(text), scroll([x,y], direction, {pixels} or legacy pages?), paste(text). Pixel distances are quantized to wheel steps by the backend. AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs emit images themselves. In niri background mode, capture and input keep the user\'s pointer, focus and workspace unchanged; getAXState() remains passive. Click/drag/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
++    try { await target.getAXState(); }
++    catch (error) {
++      if (app.startsWith('linux-window:') || !/No window matched/i.test(error.message)) throw error;
++      const launched = await call('launch_app', app);
++      app = launched.id;
++      await target.getAXState();
++    }
+     return target;
+   };
+   return cua;
+diff --git a/linux-features/computer-use-linux/native-protocol.mjs b/linux-features/computer-use-linux/native-protocol.mjs
+index d83fc63..d4946e1 100644
+--- a/linux-features/computer-use-linux/native-protocol.mjs
++++ b/linux-features/computer-use-linux/native-protocol.mjs
+@@ -2,10 +2,13 @@ export const maxBridgeMessageBytes = 8 * 1024 * 1024;
+ 
+ const parameters = {
+   list_apps: [],
++  launch_app: [],
++  toggle_maximize: [],
+   get_app_state: ['include_screenshot', 'max_nodes', 'max_depth', 'max_width', 'max_height', 'max_bytes', 'scale', 'format', 'quality'],
+   screenshot: ['max_width', 'max_height', 'max_bytes', 'scale', 'format', 'quality'],
+   click: ['x', 'y', 'button', 'click_count', 'relative'],
+   scroll: ['x', 'y', 'direction', 'pages', 'relative'],
++  drag: ['start_x', 'start_y', 'end_x', 'end_y', 'relative'],
+   press_key: ['key'],
+   type_text: ['text'],
+ };
+@@ -32,7 +35,7 @@ export function validateNativeRequest(input) {
+   if (!Object.hasOwn(parameters, method)) throw new Error('This native Linux Computer Use operation is not supported');
+   if (!params || typeof params !== 'object' || Array.isArray(params) || Object.keys(params).some(key => !parameters[method].includes(key))) throw new Error('Unsupported native operation parameter');
+   validateParameters(params);
+-  if (method === 'screenshot' && app === undefined) throw new Error('A non-empty native app id is required');
++  if (['screenshot', 'launch_app', 'toggle_maximize'].includes(method) && app === undefined) throw new Error('A non-empty native app id is required');
+   if (app !== undefined) {
+     if (typeof app !== 'string' || !app.trim()) throw new Error('A non-empty native app id is required');
+     if (app.startsWith('linux-window:')) {
+diff --git a/linux-features/computer-use-linux/native.test.js b/linux-features/computer-use-linux/native.test.js
+index 1f3f7e7..e7a6db4 100644
+--- a/linux-features/computer-use-linux/native.test.js
++++ b/linux-features/computer-use-linux/native.test.js
+@@ -27,8 +27,10 @@ test('native client preserves browser inventory and binds native actions to sele
+     const app = await cua.getApp({ windowId: 22 });
+     await app.click([2, 3]);
+     assert.deepEqual(calls.at(-1), ['sky', { method: 'click', app: 'linux-window:22', params: { x: 2, y: 3, button: 'left', click_count: 1, relative: true } }]);
++    await app.drag([1, 2], [3, 4]);
++    assert.deepEqual(calls.at(-1), ['sky', { method: 'drag', app: 'linux-window:22', params: { start_x: 1, start_y: 2, end_x: 3, end_y: 4, relative: true } }]);
+     const before = calls.length;
+-    await assert.rejects(app.drag({ x: 1, y: 2 }, { x: 3, y: 4 }), /not supported/);
++    assert.throws(() => app.drag({ x: 1, y: 2 }, { x: 3, y: 4 }), /integer window-relative/);
+     await assert.rejects(app.paste('x', { format: 'html' }), /not supported/);
+     assert.equal(calls.length, before);
+   } finally { globalThis.nodeRepl = original; }
+@@ -36,7 +38,7 @@ test('native client preserves browser inventory and binds native actions to sele
+ 
+ test('trusted service validates requests before backend launch', async () => {
+   const { handleRpc } = await import('./native-service.mjs');
+-  await assert.rejects(handleRpc({ method: 'drag', app: 'editor', params: {} }), /not supported/);
++  await assert.rejects(handleRpc({ method: 'drag', app: 'editor', params: { unsupported: true } }), /parameter/);
+   await assert.rejects(handleRpc({ method: 'click', app: 'editor', params: { window_id: 22 } }), /parameter/);
+   for (const params of [
+     {max_nodes:0}, {max_nodes:2001}, {max_depth:-1}, {max_depth:65},
+@@ -487,3 +489,44 @@ test('desktop restart needs fresh observation and ignores events from the old br
+     assert.equal(connections.length,2);
+   } finally {service.shutdown();}
+ });
++
++
++test('background launch keeps the explicitly selected compositor session', async () => {
++  const { niriEnvironment } = await import('./native-backend-service.mjs');
++  const environment = { CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1', NIRI_AGENT_LAUNCH: '1',
++    NIRI_SOCKET: '/tmp/headless-niri.sock', WAYLAND_DISPLAY: 'headless-test', XDG_RUNTIME_DIR: '/tmp/headless-runtime' };
++  assert.deepEqual(niriEnvironment(environment), environment);
++  assert.throws(() => niriEnvironment({ CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1' }), /explicit NIRI_SOCKET/);
++});
++
++test('background launch and maximize fail closed before spawning commands', async () => {
++  const { createNativeBackendService } = await import('./native-backend-service.mjs');
++  const service = createNativeBackendService({ command: '/nonexistent/backend',
++    environment: { CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED: '1' } });
++  try {
++    await assert.rejects(service.handleRpc({ method: 'launch_app', app: 'editor' }), /requires NIRI_AGENT_LAUNCH=1/);
++    await assert.rejects(service.handleRpc({ method: 'toggle_maximize', app: 'linux-window:22' }), /unsupported in niri background mode/);
++  } finally { service.shutdown(); }
++});
++
++test('vendor launch binds the new window without changing SDK window inventory', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const calls = [];
++  let launched = false;
++  globalThis.nodeRepl = { write() {}, rpc: async (service, request) => {
++    calls.push(request);
++    if (request.method === 'get_app_state' && !launched) throw new Error('No window matched editor');
++    if (request.method === 'launch_app') { launched = true; return { id: 'linux-window:22' }; }
++    return { accessibility_tree: [] };
++  } };
++  try {
++    const cua = installLinuxComputerUse({ computer: { existing: true } });
++    assert.equal(cua.computer.existing, true);
++    const app = await cua.getApp('editor');
++    await app.typeText('hello');
++    assert.deepEqual(calls.map(call => [call.method, call.app]), [
++      ['get_app_state', 'editor'], ['launch_app', 'editor'], ['get_app_state', 'linux-window:22'], ['type_text', 'linux-window:22'],
++    ]);
++  } finally { globalThis.nodeRepl = original; }
++});
+diff --git a/computer-use-linux/src/niri_agent.rs b/computer-use-linux/src/niri_agent.rs
+new file mode 100644
+index 0000000..47b493e
+--- /dev/null
++++ b/computer-use-linux/src/niri_agent.rs
+@@ -0,0 +1,198 @@
++//! niri agent input: deliver input to one window's client and capture windows without moving
++//! the user's pointer, keyboard focus or active window, and without screenshot notifications
++//! or clipboard changes.
++//!
++//! Requires a niri build with the `AgentInput` / `AgentScreenshot` IPC requests (see the
++//! niri-computer-use repository). Detected at runtime; everything falls back to the regular
++//! backends when niri lacks them, unless `CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED=1`
++//! requires agent-only operation. Set `CODEX_COMPUTER_USE_NIRI_AGENT=0` to disable.
++
++use anyhow::{anyhow, bail, Context, Result};
++use serde_json::{json, Value};
++use std::collections::HashMap;
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::net::UnixStream;
++use std::sync::Mutex;
++use std::time::Duration;
++
++/// Where the window geometry sits inside the last agent screenshot of a window.
++#[derive(Clone, Copy, Debug)]
++pub struct CaptureGeometry {
++    pub scale: f64,
++    pub geometry_x: i32,
++    pub geometry_y: i32,
++}
++
++static SUPPORT: Mutex<Option<(String, bool)>> = Mutex::new(None);
++static GEOMETRY: Mutex<Option<HashMap<u64, CaptureGeometry>>> = Mutex::new(None);
++
++pub fn background_only() -> bool {
++    std::env::var("CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED").is_ok_and(|value| value == "1")
++}
++
++pub fn require_foreground_allowed() -> Result<()> {
++    if background_only() {
++        bail!("niri background mode requires a supported targeted agent operation; foreground fallback refused; no input was sent");
++    }
++    Ok(())
++}
++
++fn socket_path() -> Option<String> {
++    std::env::var("NIRI_SOCKET").ok().filter(|s| !s.is_empty())
++}
++
++fn request_blocking(socket: &str, request: &Value) -> Result<Value> {
++    let mut stream = UnixStream::connect(socket)
++        .with_context(|| format!("failed to connect to the niri socket {socket}"))?;
++    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
++    let mut line = serde_json::to_string(request)?;
++    line.push('\n');
++    stream.write_all(line.as_bytes())?;
++    let mut reply = String::new();
++    BufReader::new(stream).read_line(&mut reply)?;
++    let reply: Value = serde_json::from_str(&reply).context("invalid niri IPC reply")?;
++    if let Some(ok) = reply.get("Ok") {
++        return Ok(ok.clone());
++    }
++    let error = reply
++        .get("Err")
++        .and_then(Value::as_str)
++        .unwrap_or("unknown niri IPC error");
++    Err(anyhow!("{error}"))
++}
++
++async fn request(request: Value) -> Result<Value> {
++    let socket = socket_path().ok_or_else(|| anyhow!("NIRI_SOCKET is not set"))?;
++    tokio::task::spawn_blocking(move || request_blocking(&socket, &request))
++        .await
++        .map_err(|e| anyhow!("niri IPC task failed: {e}"))?
++}
++
++/// Whether the running niri accepts agent requests. Cached per niri socket.
++pub fn supported() -> bool {
++    if std::env::var("CODEX_COMPUTER_USE_NIRI_AGENT").is_ok_and(|v| v == "0") {
++        return false;
++    }
++    let Some(socket) = socket_path() else {
++        return false;
++    };
++    let mut cache = SUPPORT.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some((cached_socket, supported)) = cache.as_ref() {
++        if *cached_socket == socket {
++            return *supported;
++        }
++    }
++    // A patched niri answers "no window with id 0"; an unpatched one fails to parse the request.
++    let probe = json!({ "AgentInput": { "window_id": 0, "events": [] } });
++    let supported = match request_blocking(&socket, &probe) {
++        Ok(_) => true,
++        Err(error) => error.to_string().contains("no window with id"),
++    };
++    *cache = Some((socket, supported));
++    supported
++}
++
++/// Whether agent input should be used for `window`.
++pub fn applies_to(window: &crate::windowing::WindowInfo) -> bool {
++    window.backend == "niri" && supported()
++}
++
++pub fn capture_geometry(window_id: u64) -> Option<CaptureGeometry> {
++    GEOMETRY.lock().ok()?.as_ref()?.get(&window_id).copied()
++}
++
++/// Screenshot a window into `path`, remembering its capture geometry.
++pub async fn screenshot(window_id: u64, path: &std::path::Path) -> Result<CaptureGeometry> {
++    let path = path
++        .to_str()
++        .ok_or_else(|| anyhow!("screenshot path is not UTF-8"))?
++        .to_string();
++    let reply = request(json!({
++        "AgentScreenshot": { "window_id": window_id, "path": path, "show_pointer": false }
++    }))
++    .await?;
++    let info = reply
++        .get("AgentScreenshot")
++        .ok_or_else(|| anyhow!("unexpected AgentScreenshot reply: {reply}"))?;
++    let geometry = CaptureGeometry {
++        scale: info["scale"].as_f64().unwrap_or(1.0),
++        geometry_x: info["geometry_x"].as_i64().unwrap_or(0) as i32,
++        geometry_y: info["geometry_y"].as_i64().unwrap_or(0) as i32,
++    };
++    if let Ok(mut map) = GEOMETRY.lock() {
++        map.get_or_insert_with(HashMap::new)
++            .insert(window_id, geometry);
++    }
++    Ok(geometry)
++}
++
++/// Capture geometry of a window, taking a throwaway screenshot if none is cached.
++async fn geometry_for(window_id: u64) -> Result<CaptureGeometry> {
++    if let Some(geometry) = capture_geometry(window_id) {
++        return Ok(geometry);
++    }
++    let dir = tempfile_dir()?;
++    let path = dir.join("geometry.png");
++    let result = screenshot(window_id, &path).await;
++    let _ = std::fs::remove_file(&path);
++    let _ = std::fs::remove_dir(&dir);
++    result
++}
++
++pub(crate) fn tempfile_dir() -> Result<std::path::PathBuf> {
++    use std::os::unix::fs::DirBuilderExt;
++    let mut nonce = [0u8; 16];
++    getrandom::fill(&mut nonce).map_err(|e| anyhow!("screenshot nonce: {e}"))?;
++    let name = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
++    let directory = std::env::temp_dir().join(format!("codex-niri-{name}"));
++    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
++    Ok(directory)
++}
++
++/// Convert a point in screenshot capture pixels to window-geometry logical coordinates.
++pub async fn window_point(window_id: u64, x: i32, y: i32) -> Result<(f64, f64)> {
++    let g = geometry_for(window_id).await?;
++    Ok((
++        f64::from(x - g.geometry_x) / g.scale,
++        f64::from(y - g.geometry_y) / g.scale,
++    ))
++}
++
++pub async fn input(window_id: u64, events: Vec<Value>) -> Result<()> {
++    request(json!({ "AgentInput": { "window_id": window_id, "events": events } }))
++        .await
++        .map(|_| ())
++}
++
++pub fn motion(x: f64, y: f64) -> Value {
++    json!({ "Motion": { "x": x, "y": y } })
++}
++
++pub fn button(button: u32, pressed: bool) -> Value {
++    json!({ "Button": { "button": button, "pressed": pressed } })
++}
++
++pub fn key(keycode: u16, pressed: bool) -> Value {
++    json!({ "Key": { "keycode": keycode, "pressed": pressed } })
++}
++
++pub fn axis(vertical: f64, horizontal: f64) -> Value {
++    json!({ "Axis": { "vertical": vertical, "horizontal": horizontal } })
++}
++
++pub fn text(text: &str, ctrl_shift_u: bool) -> Value {
++    let method = if ctrl_shift_u { "CtrlShiftU" } else { "Keymap" };
++    json!({ "Text": { "text": text, "unicode_input": method } })
++}
++
++/// Evdev button code for a Computer Use button name.
++pub fn button_code(name: Option<&str>) -> Result<u32> {
++    Ok(match name.map(str::to_ascii_lowercase).as_deref() {
++        None | Some("left") | Some("primary") => 0x110,
++        Some("right") | Some("secondary") => 0x111,
++        Some("middle") => 0x112,
++        Some("back") => 0x116,
++        Some("forward") => 0x115,
++        Some(other) => bail!("unsupported mouse button {other:?}"),
++    })
++}

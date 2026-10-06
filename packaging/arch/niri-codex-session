@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# Keep the stock niri session available as the rollback option.
+if systemctl --user -q is-active niri.service || systemctl --user -q is-active niri-codex.service; then
+    echo 'A niri session is already running. Select this session at login.' >&2
+    exit 1
+fi
+if [[ "${1:-}" != -l && -n "${SHELL:-}" ]] && [[ -x "$SHELL" ]] && grep -Fxq "$SHELL" /etc/shells; then
+    exec "$SHELL" -l -c 'exec /usr/bin/niri-codex-session -l'
+fi
+export PATH="/usr/lib/niri-codex-computer-use/bin:$PATH"
+systemctl --user reset-failed niri-codex.service
+systemctl --user import-environment
+if command -v dbus-update-activation-environment >/dev/null; then
+    dbus-update-activation-environment --all
+fi
+status=0
+systemctl --user --wait start niri-codex.service || status=$?
+systemctl --user start --job-mode=replace-irreversibly niri-shutdown.target
+systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET
+exit "$status"

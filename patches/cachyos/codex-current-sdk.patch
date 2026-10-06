@@ -1,0 +1,871 @@
+--- a/linux-features/computer-use-linux/patch.js
++++ b/linux-features/computer-use-linux/patch.js
+@@ -67,9 +67,9 @@
+     phase: "webview-asset",
+     order: 20_150,
+     ciPolicy: "optional",
+-    pattern: /^app-initial-[^.]+\.js$/,
++    pattern: /^app-(?:initial|shared)-[^.]+\.js$/,
+     assetMatch: matchesLinuxComputerUseHostPlatformContract,
+-    missingDescription: "current Computer Use host-platform app-initial contract",
++    missingDescription: "current Computer Use host-platform app asset contract",
+     skipDescription: "Linux Computer Use host-platform patch",
+     apply: applyLinuxComputerUseHostPlatformPatch,
+   }),
+--- a/linux-features/computer-use-linux/plugin-gate.js
++++ b/linux-features/computer-use-linux/plugin-gate.js
+@@ -1,60 +1,38 @@
+ "use strict";
+-
+-function rewriteComputerUseMarketplaceSelector(currentSource) {
+-  const selectorRegex =
+-    /if\(([^{};]*?\.marketplacePluginNames\.includes\(`computer-use`\)[^{};]*?)\)return\s*([^{};]+)(?=[;}])/g;
+-  let matchedSelectorCount = 0;
+-  const patched = currentSource.replace(selectorRegex, (_match, condition, expression) => {
+-    const ref = condition.match(/([A-Za-z_$][\w$]*)\.marketplacePluginNames/)?.[1];
+-    const pristineCondition = `${ref}.platform===\`darwin\`&&${ref}.marketplacePluginNames.includes(\`computer-use\`)`;
+-    const patchedCondition = `!((${ref}.platform!==\`darwin\`&&${ref}.platform!==\`linux\`)||!${ref}.marketplacePluginNames.includes(\`computer-use\`))`;
+-    const pristineExpression = `${ref}.desktopFeatureAvailability.computerUseNodeRepl?\`node-repl\`:\`legacy-mcp\``;
+-    const patchedExpression = `${ref}.platform===\`darwin\`&&${pristineExpression}`;
+-    if (
+-      !(condition === pristineCondition && expression === pristineExpression) &&
+-      !(condition === patchedCondition && expression === patchedExpression)
+-    ) {
+-      throw new Error("Required Linux Computer Use plugin gate patch failed: marketplace selector changed");
+-    }
+-    matchedSelectorCount += 1;
+-    return `if(${patchedCondition})return ${patchedExpression}`;
+-  });
+-  if (matchedSelectorCount !== 1) {
+-    throw new Error(`Required Linux Computer Use plugin gate patch failed: expected one marketplace selector, found ${matchedSelectorCount}`);
+-  }
+-  return patched;
+-}
+ 
+ function applyLinuxComputerUsePluginGatePatch(currentSource) {
+   const fail = () => {
+-    throw new Error("Required Linux Computer Use plugin gate patch failed: expected unique native registrations and marketplace selector");
++    throw new Error("Required Linux Computer Use plugin gate patch failed: expected one current native registration");
+   };
+   const identifier = String.raw`[A-Za-z_$][\w$]*`;
+   const reference = String.raw`${identifier}(?:\.${identifier})+`;
+-  // Match the current descriptor's shared metadata, opt-out identity and bound
+-  // feature/platform aliases together. Never infer registration from Nd alone.
++  // The current signed bundle has one shared macOS/Windows registration. Match
++  // its metadata, opt-out identity and bound feature/platform aliases together,
++  // and accept only the pristine or fully patched platform expression.
+   const descriptorPattern = new RegExp(
+-    String.raw`\{\.\.\.(${reference}\.computerUse),autoInstallOptOutKey:(${reference})\(\1\.name\),isAvailable:\(\{features:(${identifier}),platform:(${identifier})\}\)=>\4===` +
+-      "`(darwin|win32|linux)`" + String.raw`&&\3\.computerUse(?:,migrate:(${identifier}))?\}`,
++    String.raw`\{\.\.\.(${reference}\.computerUse),autoInstallOptOutKey:(${reference})\(\1\.name\),isAvailable:\(\{features:(${identifier}),platform:(${identifier})\}\)=>\(\4===` +
++      "`darwin`" + String.raw`\|\|\4===` + "`win32`" +
++      String.raw`(?:\|\|\4===` + "`linux`" + String.raw`)?\)&&\3\.computerUse\}`,
+     "g",
+   );
+   const descriptors = [...currentSource.matchAll(descriptorPattern)];
+   const spreadCount = [...currentSource.matchAll(new RegExp(String.raw`\{\.\.\.${reference}\.computerUse,`, "g"))].length;
+-  if (descriptors.length !== spreadCount || ![2, 3].includes(descriptors.length)) fail();
+-  const mac = descriptors.filter(match => match[5] === "darwin");
+-  const windows = descriptors.filter(match => match[5] === "win32");
+-  const linux = descriptors.filter(match => match[5] === "linux");
+-  if (mac.length !== 1 || windows.length !== 1 || linux.length > 1 || !mac[0][6]) fail();
+-  if (windows[0][6] || linux.some(match => match[6])) fail();
+-  if (descriptors.some(match => match[1] !== mac[0][1] || match[2] !== mac[0][2])) fail();
++  if (descriptors.length !== 1 || spreadCount !== 1) fail();
+ 
+-  const patchedSelectorSource = rewriteComputerUseMarketplaceSelector(currentSource);
+-  // Mac's migration deletes legacy macOS helpers. Linux inherits consent and
+-  // installation policy from the same metadata, but must never run that migration.
+-  if (linux.length === 1) return patchedSelectorSource;
+-  const [, metadata, optOut, features, platform] = mac[0];
+-  const linuxDescriptor = `{...${metadata},autoInstallOptOutKey:${optOut}(${metadata}.name),isAvailable:({features:${features},platform:${platform}})=>${platform}===\`linux\`&&${features}.computerUse}`;
+-  return patchedSelectorSource.replace(mac[0][0], `${mac[0][0]},${linuxDescriptor}`);
++  const [descriptor] = descriptors;
++  const pristinePlatformExpression = `${descriptor[4]}===\`darwin\`||${descriptor[4]}===\`win32\``;
++  const patchedPlatformExpression = `${pristinePlatformExpression}||${descriptor[4]}===\`linux\``;
++  const platformExpression = descriptor[0].slice(
++    descriptor[0].indexOf("=>") + 3,
++    descriptor[0].indexOf(")&&"),
++  );
++  if (platformExpression === patchedPlatformExpression) return currentSource;
++  if (platformExpression !== pristinePlatformExpression) fail();
++
++  return currentSource.replace(
++    descriptor[0],
++    descriptor[0].replace(pristinePlatformExpression, patchedPlatformExpression),
++  );
+ }
+ 
+ module.exports = { applyLinuxComputerUsePluginGatePatch };
+--- a/linux-features/computer-use-linux/unified.js
++++ b/linux-features/computer-use-linux/unified.js
+@@ -17,7 +17,7 @@
+ function applyUnifiedComputerUsePatch(source) {
+   // Match the current selector, including variable relationships. Both pristine
+   // and patched forms must have exactly one owner; drift must abort the build.
+-  const pattern = /(?<native>[\w$]+)=(?<ready>[\w$]+)&&(?<runtime>[\w$]+)\.platform===`darwin`&&(?<features>[\w$]+)\.computerUse&&(?<legacy>[\w$]+)\.enabled&&\k<legacy>\.paths\.serviceAppPath!=null(?<linux>\|\|\k<ready>&&\k<runtime>\.platform===`linux`&&\k<features>\.computerUse&&\k<legacy>\.enabled)?,(?<mode>[\w$]+)=(?<modeLinux>\k<runtime>\.platform===`linux`\?\k<native>:)?(?<modeValue>\k<features>\.computerUse&&\(\k<features>\.computerUseNodeRepl\|\|\k<native>\)&&\(!\k<features>\.browserUseTinysky\|\|\k<runtime>\.platform!==`darwin`\|\|\k<legacy>\.enabled\))(?=,)/g;
++  const pattern = /(?<native>[\w$]+)=(?<ready>[\w$]+)&&(?<runtime>[\w$]+)\.platform===`darwin`&&(?<features>[\w$]+)\.computerUse&&(?<legacy>[\w$]+)\.enabled&&\k<legacy>\.paths\.serviceAppPath!=null(?<linux>\|\|\k<ready>&&\k<runtime>\.platform===`linux`&&\k<features>\.computerUse&&\k<legacy>\.enabled)?,(?<mode>[\w$]+)=(?<modeLinux>\k<runtime>\.platform===`linux`\?\k<native>:)?(?<modeValue>\k<features>\.computerUse&&\(!\k<features>\.browserUseTinysky\|\|\k<runtime>\.platform!==`darwin`\|\|\k<legacy>\.enabled\))(?=,)/g;
+   const matches = [...source.matchAll(pattern)];
+   const owners = [...source.matchAll(/[\w$]+=[\w$]+&&[\w$]+\.platform===`darwin`&&[\w$]+\.computerUse&&[\w$]+\.enabled&&[\w$]+\.paths\.serviceAppPath/g)];
+   if (matches.length !== 1 || owners.length !== 1 || !source.includes("cuaReplSurfaces:")) {
+--- a/linux-features/computer-use-linux/unified.test.js
++++ b/linux-features/computer-use-linux/unified.test.js
+@@ -3,10 +3,11 @@
+ const vm = require("node:vm");
+ const test = require("node:test");
+ const descriptors = require("./patch.js");
++const { applyLinuxComputerUseFeaturePatch } = require("../../scripts/patches/impl/computer-use.js");
+ 
+ // The current selector boundary: unified prerequisites, platform, feature flag,
+ // and the legacy macOS service, followed by independent browser selection.
+-const selector = 'function select(f,l,t,u){let p=f&&l.platform===`darwin`&&t.computerUse&&u.enabled&&u.paths.serviceAppPath!=null,m=t.computerUse&&(t.computerUseNodeRepl||p)&&(!t.browserUseTinysky||l.platform!==`darwin`||u.enabled),h=[];return f&&t.browser&&h.push(`browser`),p&&h.push(`computer`),{computerUse:m,cuaReplSurfaces:h}}function configure(e){let i=pluginRoot(),a=path.default.join(i,`.mcp.json`),l={};e.surfaces.includes(`computer`)&&(l.sky=`@oai/sky/service`);let c={env:{CUA_REPL_ENABLED_SURFACES:e.surfaces.join(`,`),[constants.Il]:JSON.stringify(l)}};return c}';
++const selector = 'function select(f,l,t,u){let p=f&&l.platform===`darwin`&&t.computerUse&&u.enabled&&u.paths.serviceAppPath!=null,m=t.computerUse&&(!t.browserUseTinysky||l.platform!==`darwin`||u.enabled),h=[];return f&&t.browser&&h.push(`browser`),p&&h.push(`computer`),{computerUse:m,cuaReplSurfaces:h}}function configure(e){let i=pluginRoot(),a=path.default.join(i,`.mcp.json`),l={};e.surfaces.includes(`computer`)&&(l.sky=`@oai/sky/service`);let c={env:{CUA_REPL_ENABLED_SURFACES:e.surfaces.join(`,`),[constants.Il]:JSON.stringify(l)}};return c}';
+ function patch(source) {
+   return descriptors.filter(d => ["ui-feature", "unified-runtime"].includes(d.id))
+     .reduce((s, d) => d.apply(s), source);
+@@ -85,3 +86,13 @@
+ 
+   assert.throws(() => patch(duplicate), /unified.*contract/i);
+ });
++
++test("current desktop availability enables Computer Use on Linux without changing other platforms", () => {
++  const current = "function available(e,{buildFlavor:t=flavor(),env:n=process.env,platform:r=process.platform}={}){let i=r===`win32`&&n.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`?{...e,computerUse:!0}:e,o=t===`dev`?null:null;return i}";
++  const patched = applyLinuxComputerUseFeaturePatch(current);
++  const available = vm.runInNewContext(`(${patched})`, { flavor: () => "stable", process: { env: {}, platform: "linux" } });
++  assert.equal(available({ computerUse: false }, { platform: "linux" }).computerUse, true);
++  assert.equal(available({ computerUse: false }, { platform: "darwin" }).computerUse, false);
++  assert.equal(available({ computerUse: false }, { platform: "win32", env: { CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE: "1" } }).computerUse, true);
++  assert.equal(applyLinuxComputerUseFeaturePatch(patched), patched);
++});
+--- a/linux-features/computer-use-linux/native-client.mjs
++++ b/linux-features/computer-use-linux/native-client.mjs
+@@ -1,3 +1,5 @@
++import { nativeWindows } from './native-protocol.mjs';
++
+ // Installed after upstream setupCUA; browser ownership remains upstream.
+ export function installLinuxComputerUse(cua) {
+   const runtime = globalThis.nodeRepl;
+@@ -49,7 +51,12 @@
+     };
+   };
+   const browserState = cua.getState?.bind(cua);
+-  cua.listApps = async (options = {}) => emit(await call('list_apps'), options);
++  cua.listApps = async (options = {}) => {
++    const apps = await call('list_apps');
++    const windows = nativeWindows(apps);
++    return emit(apps.map((app, index) => ({ ...app, windows: [windows[index]] })), options);
++  };
++  cua.listWindows = async (options = {}) => emit(nativeWindows(await call('list_apps')), options);
+   const linuxState = async (options = {}) => {
+     const state = browserState ? await browserState({ emit: false }) : { browsers: [] };
+     return emit({ ...state, apps: await cua.listApps({ emit: false }) }, options);
+@@ -57,6 +64,10 @@
+   cua.getState = linuxState;
+   cua.initialize = linuxState;
+   cua.getApp = async (app) => {
++    if (typeof app === 'object' && app !== null) {
++      if (!Number.isSafeInteger(app.windowId) || app.windowId <= 0) throw new Error('getApp requires a positive safe windowId from listWindows');
++      app = `linux-window:${app.windowId}`;
++    }
+     if (typeof app !== 'string' || !app.trim()) throw new Error('getApp requires a non-empty app id');
+     const unsupported = async () => { throw new Error('This native Linux Computer Use operation is not supported'); };
+     const state = options => call('get_app_state', app, { include_screenshot: false, ...axBackendOptions(options) });
+@@ -121,14 +132,18 @@
+       click: (location, options = {}) => call('click', app, { ...point(location), button: options.mouseButton ?? 'left', click_count: options.clickCount ?? 1, relative: true }),
+       pressKey: key => call('press_key', app, { key }),
+       typeText: text => call('type_text', app, { text }),
+-      scroll: (location, direction, pages = 1) => call('scroll', app, { ...point(location), direction, pages, relative: true }),
++      scroll: (location, direction, distance = 1) => {
++        const pages = typeof distance === 'object' && distance !== null ? distance.pixels / 600 : distance;
++        if (typeof pages !== 'number' || !Number.isFinite(pages) || pages <= 0) throw new Error('Linux scroll requires a positive distance or { pixels }');
++        return call('scroll', app, { ...point(location), direction, pages, relative: true });
++      },
+       paste: async (text, options = {}) => {
+         if (options.format && options.format !== 'text') return unsupported();
+         return call('type_text', app, { text });
+       },
+       drag: unsupported, selectText: unsupported, setValue: unsupported, performSecondaryAction: unsupported,
+     };
+-    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), pressKey(key), typeText(text), scroll([x,y], direction, pages?), paste(text). AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs bring the selected window forward and emit images themselves; getAXState() remains passive. Click/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, drag, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
++    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), pressKey(key), typeText(text), scroll([x,y], direction, {pixels} or legacy pages?), paste(text). Pixel distances are quantized to wheel steps by the backend. AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs bring the selected window forward and emit images themselves; getAXState() remains passive. Click/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, drag, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
+     await target.getAXState();
+     return target;
+   };
+--- a/linux-features/computer-use-linux/native-protocol.mjs
++++ b/linux-features/computer-use-linux/native-protocol.mjs
+@@ -51,3 +51,18 @@
+   }
+   return { app_id: app };
+ }
++
++// Keep uint64 IDs as strings when JavaScript cannot represent them exactly.
++export function nativeWindows(apps) {
++  return apps.map(app => {
++    const rawId = app.id?.startsWith('linux-window:') ? app.id.slice('linux-window:'.length) : undefined;
++    if (!rawId || !/^\d+$/.test(rawId)) throw new Error('Native inventory returned an invalid window id');
++    const numericId = Number(rawId);
++    return { id: Number.isSafeInteger(numericId) ? numericId : rawId, app: app.displayName, title: app.title };
++  });
++}
++
++export function nativeSkyApps(apps) {
++  const windows = nativeWindows(apps);
++  return apps.map((app, index) => ({ id: app.id, name: app.displayName, windows: [windows[index]] }));
++}
+--- a/linux-features/computer-use-linux/native-service.mjs
++++ b/linux-features/computer-use-linux/native-service.mjs
+@@ -1,5 +1,5 @@
+ import path from 'node:path';
+-import { maxBridgeMessageBytes, validateNativeRequest } from './native-protocol.mjs';
++import { maxBridgeMessageBytes, validateNativeRequest, nativeWindows, nativeSkyApps } from './native-protocol.mjs';
+ 
+ function defaultConnection() {
+   const runtime = globalThis.nodeRepl;
+@@ -17,9 +17,10 @@
+ // validator through NodeREPL's privileged native-pipe bridge. A failed or timed
+ // out action poisons this connection and is never replayed.
+ export function createNativeService({ connect = defaultConnection, timeoutMs = 120_000 } = {}) {
+-  let connection, ready, failure, sequence = 0, buffered = Buffer.alloc(0);
++  let connection, ready, failure, sequence = 0, generation = 0, canRecover = false, closed = false, buffered = Buffer.alloc(0);
+   const pending = new Map();
+-  function stop(error) {
++  function stop(error, recoverable = false) {
++    if (!failure) canRecover = recoverable && !closed;
+     failure ??= error;
+     for (const { reject, timer } of pending.values()) {
+       clearTimeout(timer);
+@@ -28,7 +29,7 @@
+     pending.clear();
+     connection?.end();
+   }
+-  const shutdown = () => stop(new Error('Linux Computer Use host bridge shut down'));
++  const shutdown = () => { closed = true; stop(new Error('Linux Computer Use host bridge shut down')); };
+   function handleData(chunk) {
+     buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+     for (;;) {
+@@ -57,16 +58,35 @@
+   async function start() {
+     if (failure) throw failure;
+     if (!ready) ready = (async () => {
+-      connection = await connect();
+-      connection.on('data', handleData);
+-      connection.on('error', error => stop(new Error(`Linux Computer Use host bridge: ${error.message}`)));
+-      connection.on('close', () => stop(new Error('Linux Computer Use host bridge closed; not replayed')));
++      const current = ++generation;
++      try { connection = await connect(); }
++      catch (error) { stop(error, true); throw error; }
++      connection.on('data', chunk => { if (current === generation) handleData(chunk); });
++      connection.on('error', error => { if (current === generation) stop(new Error(`Linux Computer Use host bridge: ${error.message}`), true); });
++      connection.on('close', () => { if (current === generation) stop(new Error('Linux Computer Use host bridge closed; not replayed'), true); });
+     })();
+     await ready;
+   }
+   async function handleRpc(input) {
+-    if (input?.type === 'setup') return { target: 'linux', methods: [] };
++    if (input?.type === 'setup') return { target: 'linux', methods: ['list_apps', 'list_windows'] };
++    if (input?.type === 'execute') {
++      if (!['list_apps', 'list_windows'].includes(input.method) || !Array.isArray(input.args) || input.args.length !== 0) {
++        throw new Error('Unsupported native Sky operation');
++      }
++      const apps = await handleRpc({ method: 'list_apps' });
++      return input.method === 'list_apps' ? nativeSkyApps(apps) : nativeWindows(apps);
++    }
+     validateNativeRequest(input);
++    // Only a new inventory or AX request can recover a disconnected bridge.
++    // Failed actions are rejected, never replayed, and timeouts remain fatal.
++    if (failure && canRecover && !closed && ['list_apps', 'get_app_state'].includes(input.method)) {
++      generation++;
++      connection = undefined;
++      ready = undefined;
++      failure = undefined;
++      canRecover = false;
++      buffered = Buffer.alloc(0);
++    }
+     await start();
+     if (failure) throw failure;
+     return await new Promise((resolve, reject) => {
+--- a/linux-features/computer-use-linux/native.test.js
++++ b/linux-features/computer-use-linux/native.test.js
+@@ -8,7 +8,7 @@
+   const original = globalThis.nodeRepl;
+   globalThis.nodeRepl = { write() {}, rpc: async (service, request) => {
+     calls.push([service, request]);
+-    if (request.method === 'list_apps') return [{ id: 'org.example.Editor', isRunning: true }];
++    if (request.method === 'list_apps') return [{ id: 'linux-window:22', displayName: 'Editor', title: 'Document', isRunning: true }];
+     if (request.method === 'get_app_state') return { accessibility_tree: [{ name: 'Document' }] };
+     return { ok: true };
+   }};
+@@ -16,12 +16,17 @@
+     const inheritedState = async () => ({ apps: [], browsers: [{ id: 'iab' }] });
+     const cua = { getState: inheritedState, initialize: inheritedState };
+     installLinuxComputerUse(cua);
+-    const expected = { apps: [{ id: 'org.example.Editor', isRunning: true }], browsers: [{ id: 'iab' }] };
++    const expected = { apps: [{ id: 'linux-window:22', displayName: 'Editor', title: 'Document', isRunning: true, windows: [{ id: 22, app: 'Editor', title: 'Document' }] }], browsers: [{ id: 'iab' }] };
+     assert.deepEqual(await cua.getState({ emit: false }), expected);
+     assert.deepEqual(await cua.initialize({ emit: false }), expected);
+-    const app = await cua.getApp('org.example.Editor');
++    assert.deepEqual(await cua.listWindows({ emit: false }), [{ id: 22, app: 'Editor', title: 'Document' }]);
++    const beforeInvalid = calls.length;
++    await assert.rejects(cua.getApp({windowId: 0}), /positive safe windowId/);
++    await assert.rejects(cua.getApp({windowId: Number.MAX_SAFE_INTEGER + 1}), /positive safe windowId/);
++    assert.equal(calls.length, beforeInvalid);
++    const app = await cua.getApp({ windowId: 22 });
+     await app.click([2, 3]);
+-    assert.deepEqual(calls.at(-1), ['sky', { method: 'click', app: 'org.example.Editor', params: { x: 2, y: 3, button: 'left', click_count: 1, relative: true } }]);
++    assert.deepEqual(calls.at(-1), ['sky', { method: 'click', app: 'linux-window:22', params: { x: 2, y: 3, button: 'left', click_count: 1, relative: true } }]);
+     const before = calls.length;
+     await assert.rejects(app.drag({ x: 1, y: 2 }, { x: 3, y: 4 }), /not supported/);
+     await assert.rejects(app.paste('x', { format: 'html' }), /not supported/);
+@@ -48,7 +53,7 @@
+   const service = createNativeService({ connect: () => assert.fail('setup must not connect to the host bridge') });
+   assert.deepEqual(await service.handleRpc({ type: 'setup' }), {
+     target: 'linux',
+-    methods: [],
++    methods: ['list_apps', 'list_windows'],
+   });
+ });
+ 
+@@ -403,3 +408,82 @@
+     await assert.rejects(service.handleRpc({method:'screenshot',app:'editor'}), /targeted screenshot/);
+   });
+ }
++
++
++test('Sky inventory dispatch maps exact window IDs and rejects unsupported calls before connection', async () => {
++  const { createNativeService } = await import('./native-service.mjs');
++  const connection = new EventEmitter();
++  let writes = 0;
++  connection.end = () => {};
++  connection.write = data => {
++    writes++;
++    const { id, input } = JSON.parse(data.toString());
++    assert.deepEqual(input, {method: 'list_apps'});
++    queueMicrotask(() => connection.emit('data', Buffer.from(JSON.stringify({id, result: [
++      {id:'linux-window:22', displayName:'Editor', title:'Document'},
++      {id:'linux-window:18446744073709551615', displayName:'Large ID', title:'Exact'}
++    ]}) + '\n')));
++  };
++  const service = createNativeService({connect: async () => connection});
++  try {
++    await assert.rejects(service.handleRpc({type:'execute',method:'click',args:[]}), /Unsupported native Sky/);
++    await assert.rejects(service.handleRpc({type:'execute',method:'list_apps',args:[{}]}), /Unsupported native Sky/);
++    assert.equal(writes, 0);
++    const apps = await service.handleRpc({type:'execute',method:'list_apps',args:[]});
++    assert.deepEqual(apps[0], {id:'linux-window:22',name:'Editor',windows:[{id:22,app:'Editor',title:'Document'}]});
++    const windows = await service.handleRpc({type:'execute',method:'list_windows',args:[]});
++    assert.equal(windows[1].id, '18446744073709551615');
++    assert.deepEqual(windows[0], apps[0].windows[0]);
++  } finally { service.shutdown(); }
++});
++
++
++test('a missing native pipe retries only a later explicit observation', async () => {
++  const {createNativeService} = await import('./native-service.mjs');
++  let attempts = 0, writes = 0;
++  const connection = new EventEmitter(); connection.end = () => {};
++  connection.write = data => {
++    writes++;
++    const {id} = JSON.parse(data.toString());
++    queueMicrotask(() => connection.emit('data', Buffer.from(JSON.stringify({id,result:[]})+'\n')));
++  };
++  const service = createNativeService({connect:async () => {
++    if (++attempts === 1) throw new Error('native pipe path unavailable: No such file or directory');
++    return connection;
++  }});
++  try {
++    await assert.rejects(service.handleRpc({method:'list_apps'}),/native pipe path unavailable/);
++    assert.equal(attempts,1);assert.equal(writes,0);
++    await assert.rejects(service.handleRpc({method:'type_text',app:'linux-window:22',params:{text:'no replay'}}),/native pipe path unavailable/);
++    assert.equal(attempts,1);
++    assert.deepEqual(await service.handleRpc({method:'list_apps'}),[]);
++    assert.equal(attempts,2);assert.equal(writes,1);
++  } finally {service.shutdown();}
++});
++
++test('desktop restart needs fresh observation and ignores events from the old bridge', async () => {
++  const {createNativeService} = await import('./native-service.mjs');
++  const connections = [];
++  const service = createNativeService({connect:async () => {
++    const c=new EventEmitter(); c.end=()=>{};c.writes=[];
++    c.write=data=>{
++      const r=JSON.parse(data.toString());c.writes.push(r.input);
++      queueMicrotask(()=>c.emit('data',Buffer.from(JSON.stringify({id:r.id,result:[]})+'\n')));
++    };connections.push(c);return c;
++  }});
++  try {
++    await service.handleRpc({method:'list_apps'});
++    connections[0].emit('close');
++    await assert.rejects(service.handleRpc({method:'type_text',app:'linux-window:22',params:{text:'not sent'}}),/closed/);
++    assert.equal(connections.length,1);assert.equal(connections[0].writes.length,1);
++    await service.handleRpc({method:'get_app_state',app:'linux-window:22'});
++    assert.equal(connections.length,2);
++    connections[0].emit('close');
++    connections[0].emit('data',Buffer.from('invalid old message\n'));
++    await service.handleRpc({method:'type_text',app:'linux-window:22',params:{text:'new explicit action'}});
++    assert.equal(connections[1].writes.filter(r=>r.method==='type_text').length,1);
++    service.shutdown();
++    await assert.rejects(service.handleRpc({method:'list_apps'}),/shut down/);
++    assert.equal(connections.length,2);
++  } finally {service.shutdown();}
++});
+--- a/linux-features/computer-use-linux/stage.js
++++ b/linux-features/computer-use-linux/stage.js
+@@ -28,7 +28,7 @@
+ }
+ 
+ // The app materializes bundled plugin caches by version, not resource contents.
+-manifest.version = manifest.version.replace(/-linux-native\.\d+$/, "") + "-linux-native.6";
++manifest.version = manifest.version.replace(/-linux-native\.\d+$/, "") + "-linux-native.8";
+ fs.mkdirSync(path.join(target, "scripts"), { recursive: true });
+ for (const name of ["native-client.mjs", "native-service.mjs", "native-backend-service.mjs", "native-protocol.mjs"]) {
+   fs.copyFileSync(path.join(__dirname, name), path.join(target, "scripts", name));
+--- a/linux-features/computer-use-linux/stage.sh
++++ b/linux-features/computer-use-linux/stage.sh
+@@ -4,6 +4,8 @@
+ backend="${CODEX_COMPUTER_USE_BINARY_SOURCE:-$SCRIPT_DIR/target/release/codex-computer-use-linux}"
+ cosmic="${CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE:-$SCRIPT_DIR/target/release/codex-computer-use-cosmic}"
+ target="$INSTALL_DIR/resources/plugins/openai-bundled/plugins/unified-computer-use"
++feature_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++node_bin="$INSTALL_DIR/resources/cua_node/bin/node"
+ 
+ [ -x "$backend" ] || {
+     echo "Linux Computer Use is enabled but its release binary is missing: $backend" >&2
+@@ -13,7 +15,14 @@
+     echo "Linux Computer Use is enabled but its COSMIC helper is missing: $cosmic" >&2
+     exit 1
+ }
+-node "$(dirname "${BASH_SOURCE[0]}")/stage.js"
++[ -x "$node_bin" ] || {
++    echo "Linux Computer Use candidate bundled Node runtime is missing: $node_bin" >&2
++    exit 1
++}
++"$node_bin" "$feature_dir/stage.js"
++"$node_bin" --test --test-timeout=10000 --test-reporter=dot \
++    "$feature_dir/native.test.js" "$feature_dir/unified.test.js" "$feature_dir/host-service.test.js"
++"$node_bin" "$feature_dir/validate-runtime.mjs"
+ mkdir -p "$target/bin"
+ install -m 0755 "$backend" "$target/bin/codex-computer-use-linux"
+ install -m 0755 "$cosmic" "$target/bin/codex-computer-use-cosmic"
+--- a/linux-features/computer-use-linux/test.js
++++ b/linux-features/computer-use-linux/test.js
+@@ -40,6 +40,10 @@
+   const visibility = descriptors.find(({ id }) => id === "native-settings-visibility");
+   assert.equal(visibility.pattern.test("app-initial-3e128f859aa3.js"), true);
+   assert.equal(visibility.pattern.test("app-primary-72206882651c.js"), false);
++  const hostPlatform = descriptors.find(({ id }) => id === "host-platform");
++  assert.equal(hostPlatform.pattern.test("app-initial-3e128f859aa3.js"), true);
++  assert.equal(hostPlatform.pattern.test("app-shared-bdab4bd87736.js"), true);
++  assert.equal(hostPlatform.pattern.test("app-primary-72206882651c.js"), false);
+ });
+ 
+ test("computer-use-linux staging consumes release artifacts without invoking Cargo", () => {
+@@ -85,7 +89,7 @@
+   fs.writeFileSync(mcpPath, originalMcp);
+   stage();
+   const version = JSON.parse(fs.readFileSync(path.join(target, ".codex-plugin/plugin.json"))).version;
+-  assert.equal(version, "26.908.31748-linux-native.6");
++  assert.equal(version, "26.908.31748-linux-native.8");
+   assert.deepEqual(JSON.parse(fs.readFileSync(marketplacePath)).plugins.map(p => p.name), ["unified-computer-use", "browser", "computer-use"]);
+   const settingsManifest = JSON.parse(fs.readFileSync(path.join(target, "../computer-use/.codex-plugin/plugin.json")));
+   assert.equal(settingsManifest.mcpServers, undefined);
+@@ -106,9 +110,9 @@
+   previousManifest.version = "26.901.41600-linux-native.1";
+   fs.writeFileSync(manifestPath, JSON.stringify(previousManifest));
+   stage();
+-  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.6");
+-  stage();
+-  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.6");
++  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.8");
++  stage();
++  assert.equal(JSON.parse(fs.readFileSync(manifestPath)).version, "26.901.41600-linux-native.8");
+   fs.writeFileSync(mcpPath, "upstream drift");
+   assert.throws(stage, /unified.*contract/i);
+ });
+@@ -163,53 +167,35 @@
+   assert.equal(applyLinuxComputerUseHostPlatformPatch(source), source);
+ });
+ 
+-// Current signed Linux main-bundle descriptor and selector contracts. Keep the
+-// Windows entry adjacent: both entries inherit the same native plugin metadata.
+-const nativeRegistration = "{...n.nc.computerUse,autoInstallOptOutKey:n.sc(n.nc.computerUse.name),isAvailable:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:one}";
+-const windowsRegistration = "{...n.nc.computerUse,autoInstallOptOutKey:n.sc(n.nc.computerUse.name),isAvailable:({features:e,platform:t})=>t===`win32`&&e.computerUse}";
+-const nativeSelector = "function Nd(e){if(e.platform===`darwin`&&e.marketplacePluginNames.includes(`computer-use`))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`}";
+-const retiredNativeSelector = "function Nd(e){if(!(e.platform!==`darwin`||!e.marketplacePluginNames.includes(`computer-use`)))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`}";
+-const registrationFixture = `var kd=[${nativeRegistration},${windowsRegistration}];${nativeSelector}`;
++// Current signed Linux main-bundle contract. macOS and Windows share one
++// descriptor, so Linux must extend that exact platform expression.
++const nativeRegistration = "{...n.nc.computerUse,autoInstallOptOutKey:n.sc(n.nc.computerUse.name),isAvailable:({features:e,platform:t})=>(t===`darwin`||t===`win32`)&&e.computerUse}";
++const linuxRegistration = "{...n.nc.computerUse,autoInstallOptOutKey:n.sc(n.nc.computerUse.name),isAvailable:({features:e,platform:t})=>(t===`darwin`||t===`win32`||t===`linux`)&&e.computerUse}";
++const registrationFixture = `var kd=[${nativeRegistration}];`;
+ 
+ function evaluateNativeRegistration(source) {
+   const n = {
+     nc: { computerUse: { name: "computer-use", installWhenMissing: true, installWhenMissingRequiresOptIn: true } },
+     sc: name => `auto-install-opt-out:${name}`,
+   };
+-  const one = () => "migration";
+-  return new Function("n", "one", `${source};return {descriptors:kd,select:Nd}`)(n, one);
++  return new Function("n", `${source};return kd`)(n);
+ }
+ 
+-test("current spread registration enables Linux while preserving native consent and other platforms", () => {
++test("current shared registration enables Linux while preserving consent and other platforms", () => {
+   const source = applyLinuxComputerUsePluginGatePatch(registrationFixture);
+-  const { descriptors, select } = evaluateNativeRegistration(source);
+-  const upstream = evaluateNativeRegistration(registrationFixture).descriptors;
+-  assert.equal(descriptors.length, 3);
+-  const native = descriptors.find(d => d.isAvailable({ platform: "linux", features: { computerUse: true } }));
+-  const mac = descriptors.find(d => d.migrate);
+-  const windows = descriptors.find(d => d.isAvailable({ platform: "win32", features: { computerUse: true } }));
++  const [native] = evaluateNativeRegistration(source);
++  const [upstream] = evaluateNativeRegistration(registrationFixture);
+   for (const platform of ["linux", "darwin", "win32", "freebsd"]) {
+     for (const computerUse of [false, true]) {
+       const context = { platform, features: { computerUse } };
+-      assert.equal(native.isAvailable(context), computerUse && platform === "linux");
+-      assert.equal(windows.isAvailable(context), upstream[1].isAvailable(context));
+-      assert.equal(mac.isAvailable(context), upstream[0].isAvailable(context));
++      assert.equal(native.isAvailable(context), computerUse && ["linux", "darwin", "win32"].includes(platform));
++      if (platform !== "linux") assert.equal(native.isAvailable(context), upstream.isAvailable(context));
+     }
+   }
+   assert.equal(native.installWhenMissingRequiresOptIn, true);
+   assert.equal(native.installWhenMissing, true);
+-  assert.equal(native.autoInstallOptOutKey, upstream[0].autoInstallOptOutKey);
+-  assert.equal(native.migrate, undefined);
+-  assert.equal(mac.migrate(), "migration");
+-  assert.ok(source.includes(nativeRegistration));
+-  assert.ok(source.includes(windowsRegistration));
+-  for (const platform of ["linux", "darwin", "win32"]) {
+-    for (const computerUseNodeRepl of [false, true]) {
+-      const args = { platform, marketplacePluginNames: ["computer-use"], desktopFeatureAvailability: { computerUseNodeRepl } };
+-      assert.equal(select(args), platform === "linux" ? "legacy-mcp" : platform === "darwin" ? computerUseNodeRepl ? "node-repl" : "legacy-mcp" : undefined);
+-      assert.equal(select({ ...args, marketplacePluginNames: [] }), undefined);
+-    }
+-  }
++  assert.equal(native.autoInstallOptOutKey, upstream.autoInstallOptOutKey);
++  assert.ok(source.includes(linuxRegistration));
+   assert.equal(applyLinuxComputerUsePluginGatePatch(source), source);
+ });
+ 
+@@ -217,21 +203,18 @@
+   const browser = "{...n.nc.browser,isAvailable:({features:e})=>e.computerUse||e.externalBrowserUse}";
+   const fixture = registrationFixture.replace("var kd=[", `var kd=[${browser},`).replaceAll("n.nc", "q.registry").replaceAll("n.sc", "q.optOut").replaceAll("features:e,platform:t", "features:flags,platform:os").replaceAll("t===", "os===").replaceAll("e.computerUse", "flags.computerUse");
+   const result = applyLinuxComputerUsePluginGatePatch(fixture);
+-  assert.ok(result.includes("os===`linux`&&flags.computerUse"));
++  assert.ok(result.includes("os===`linux`)&&flags.computerUse"));
+   assert.ok(result.includes(browser.replaceAll("n.nc", "q.registry").replaceAll("e.computerUse", "flags.computerUse")));
+ });
+ 
+ for (const [name, fixture] of [
+-  ["missing registration with usable selector", nativeSelector],
++  ["missing registration", "var kd=[];"],
+   ["duplicate native registration", registrationFixture.replace(nativeRegistration, `${nativeRegistration},${nativeRegistration}`)],
+-  ["mixed patched and original registration", registrationFixture.replace(nativeRegistration, `${nativeRegistration},${nativeRegistration.replace("t===`darwin`", "(t===`darwin`||t===`linux`)")}`)],
++  ["mixed patched and original registration", registrationFixture.replace(nativeRegistration, `${nativeRegistration},${linuxRegistration}`)],
+   ["wrong opt-out reference", registrationFixture.replace("n.sc(n.nc.computerUse.name)", "n.sc(n.nc.browser.name)")],
+-  ["partial descriptor", registrationFixture.replace(",migrate:one", "")],
+-  ["missing Windows descriptor", registrationFixture.replace(`,${windowsRegistration}`, "")],
+-  ["unsupported gate", registrationFixture.replace("t===`darwin`&&e.computerUse", "t===`darwin`||e.computerUse")],
+-  ["missing selector", registrationFixture.replace(nativeSelector, "")],
+-  ["duplicate selectors", registrationFixture + nativeSelector],
+-  ["retired selector", registrationFixture.replace(nativeSelector, retiredNativeSelector)],
++  ["missing Windows platform", registrationFixture.replace("||t===`win32`", "")],
++  ["reordered platforms", registrationFixture.replace("t===`darwin`||t===`win32`", "t===`win32`||t===`darwin`")],
++  ["unsupported gate", registrationFixture.replace(")&&e.computerUse", ")||e.computerUse")],
+ ]) {
+   test(`native plugin patch rejects ${name}`, () => {
+     assert.throws(() => applyLinuxComputerUsePluginGatePatch(fixture), /Required Linux Computer Use plugin gate patch failed/);
+@@ -241,33 +224,12 @@
+ 
+ test("native plugin patch rejects partial or duplicate Linux registrations", () => {
+   const patched = applyLinuxComputerUsePluginGatePatch(registrationFixture);
+-  const linux = "{...n.nc.computerUse,autoInstallOptOutKey:n.sc(n.nc.computerUse.name),isAvailable:({features:e,platform:t})=>t===`linux`&&e.computerUse}";
+   for (const bad of [
+-    patched.replace(linux, `${linux},${linux}`),
+-    patched.replace(linux, linux.replace("&&e.computerUse", "||e.computerUse")),
+-    patched.replace(linux, linux.replace(".name)", ".name),installWhenMissing:!0")),
+-    patched.replace(linux, linux.replace("&&e.computerUse}", "&&e.computerUse,migrate:one}")),
++    patched.replace(linuxRegistration, `${linuxRegistration},${linuxRegistration}`),
++    patched.replace("||t===`linux`", "||t===`linux`||t===`linux`"),
++    patched.replace("&&e.computerUse", "||e.computerUse"),
++    patched.replace(".name)", ".name),installWhenMissing:!0"),
+   ]) {
+     assert.throws(() => applyLinuxComputerUsePluginGatePatch(bad), /Required Linux Computer Use plugin gate patch failed/);
+   }
+ });
+-
+-// Reject changed complete selectors, including a changed owner beside a valid one.
+-test("marketplace selector rejects changed expressions and companion owners", () => {
+-  const patched = applyLinuxComputerUsePluginGatePatch(registrationFixture);
+-  const patchedSelector = patched.slice(patched.indexOf("function Nd"));
+-  const registry = registrationFixture.replace(nativeSelector, "");
+-  for (const selector of [nativeSelector, patchedSelector]) {
+-    for (const changed of [
+-      selector.replace("computerUseNodeRepl", "newGate"),
+-      selector.replace("`legacy-mcp`", "`other-backend`"),
+-      selector.replace("e.desktopFeatureAvailability", "other.desktopFeatureAvailability"),
+-      selector.replace("e.platform", "other.platform"),
+-      selector.replace("return ", "return extra&&"),
+-      selector.replace("`legacy-mcp`", "`legacy-mcp`&&e.newGate"),
+-    ]) {
+-      assert.throws(() => applyLinuxComputerUsePluginGatePatch(registry + changed), /marketplace selector/);
+-      assert.throws(() => applyLinuxComputerUsePluginGatePatch(registry + selector + changed), /marketplace selector/);
+-    }
+-  }
+-});
+--- /dev/null
++++ b/linux-features/computer-use-linux/validate-runtime.mjs
+@@ -0,0 +1,81 @@
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import { createRequire } from 'node:module';
++import path from 'node:path';
++import { pathToFileURL } from 'node:url';
++
++let sequence = 0;
++
++// This checks the candidate SDK contract with a fake host, not privileged pipe access.
++export async function validateRuntime({ installDir = process.env.INSTALL_DIR, createService } = {}) {
++  assert(installDir && path.isAbsolute(installDir), 'INSTALL_DIR must be an absolute candidate directory');
++  const scripts = path.join(installDir, 'resources/plugins/openai-bundled/plugins/unified-computer-use/scripts');
++  createService ??= (await import(pathToFileURL(path.join(scripts, 'native-service.mjs')))).createNativeService;
++  const require = createRequire(path.join(installDir, 'resources/cua_node/lib/package.json'));
++  const skyPath = path.join(path.dirname(require.resolve('@oai/sky')), 'sky.js');
++  const statePath = path.join(path.dirname(require.resolve('@oai/cua')), 'get_state.js');
++  const inventory = [
++    { id: 'linux-window:22', displayName: 'Validator', title: 'Synthetic window', isRunning: true },
++    { id: 'linux-window:18446744073709551615', displayName: 'Validator large ID', title: 'Synthetic large window', isRunning: true },
++  ];
++  const windows = [
++    { id: 22, app: 'Validator', title: 'Synthetic window' },
++    { id: '18446744073709551615', app: 'Validator large ID', title: 'Synthetic large window' },
++  ];
++  const connection = new EventEmitter();
++  const expectedError = 'synthetic Linux CUA host failure';
++  let failHost = false, connections = 0, requests = 0;
++  connection.end = () => {};
++  connection.write = bytes => {
++    const { id, input } = JSON.parse(Buffer.from(bytes).toString('utf8'));
++    assert.deepEqual(input, { method: 'list_apps' }, 'SDK smoke must only request synthetic inventory');
++    requests += 1;
++    const response = Buffer.from(JSON.stringify(failHost ? { id, error: expectedError } : { id, result: inventory }) + '\n');
++    queueMicrotask(() => {
++      connection.emit('data', response.subarray(0, 5));
++      connection.emit('data', response.subarray(5));
++    });
++  };
++  const service = createService({ connect: async () => { connections += 1; return connection; }, timeoutMs: 1000 });
++  const previous = globalThis.nodeRepl;
++  try {
++    assert.deepEqual(await service.handleRpc({ type: 'setup' }), { target: 'linux', methods: ['list_apps', 'list_windows'] });
++    assert.equal(connections, 0, 'setup must not connect to the host');
++    globalThis.nodeRepl = { rpc(name, input) { assert.equal(name, 'sky'); return service.handleRpc(input); } };
++    const skyUrl = pathToFileURL(skyPath);
++    skyUrl.searchParams.set('linuxUpdateValidation', String(++sequence));
++    const { sky } = await import(skyUrl);
++    const { get_state } = await import(pathToFileURL(statePath));
++    assert.equal(sky.target, 'linux');
++    for (const method of ['list_apps', 'list_windows']) assert.equal(typeof sky[method], 'function', `SDK did not bootstrap ${method}`);
++    const expectedApps = inventory.map((app, index) => ({ id: app.id, displayName: app.displayName, isRunning: true, windows: [windows[index]] }));
++    assert.deepEqual(await get_state({ computer: sky }), { apps: expectedApps, browsers: [] });
++    assert.deepEqual(await sky.list_windows(), windows);
++    failHost = true;
++    await assert.rejects(sky.list_apps(), error => error.message === expectedError);
++    const failedState = await get_state({ computer: sky });
++    assert.deepEqual(failedState.apps, []);
++    assert.equal(failedState.errors?.length, 1, 'get_state must preserve inventory errors');
++    assert(failedState.errors[0].includes(expectedError), 'get_state lost the host error');
++    assert.equal(requests, 4, 'SDK inventory must reach the fake transport without replay');
++    assert.equal(connections, 1);
++  } finally {
++    service.shutdown();
++    if (previous === undefined) delete globalThis.nodeRepl;
++    else globalThis.nodeRepl = previous;
++  }
++}
++
++if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
++  const deadline = setTimeout(() => {
++    console.error('Linux Computer Use candidate SDK validation timed out');
++    process.exit(1);
++  }, 5000);
++  try {
++    await validateRuntime();
++    console.log('Linux Computer Use candidate SDK inventory validation passed (fake host)');
++  } catch (error) {
++    console.error(`Linux Computer Use candidate SDK validation failed: ${error.message}`);
++    process.exitCode = 1;
++  } finally { clearTimeout(deadline); }
++}
+--- /dev/null
++++ b/linux-features/computer-use-linux/validator.test.js
+@@ -0,0 +1,91 @@
++'use strict';
++const assert = require('node:assert/strict');
++const { execFileSync, spawnSync } = require('node:child_process');
++const fs = require('node:fs');
++const os = require('node:os');
++const path = require('node:path');
++const { pathToFileURL } = require('node:url');
++const test = require('node:test');
++
++const repoRoot = path.resolve(__dirname, '../..');
++const installDir = process.env.INSTALL_DIR;
++const candidateTest = { skip: !installDir };
++
++async function modules() {
++  const { validateRuntime } = await import('./validate-runtime.mjs');
++  const { createNativeService } = await import(pathToFileURL(path.join(installDir,
++    'resources/plugins/openai-bundled/plugins/unified-computer-use/scripts/native-service.mjs')));
++  return { validateRuntime, createNativeService };
++}
++
++test('candidate SDK bootstraps inventory and preserves synthetic host errors', candidateTest, async () => {
++  const { validateRuntime } = await modules();
++  await validateRuntime({ installDir });
++});
++
++test('validator rejects an incomplete setup handshake', candidateTest, async () => {
++  const { validateRuntime, createNativeService } = await modules();
++  await assert.rejects(validateRuntime({ installDir, createService(options) {
++    const service = createNativeService(options);
++    return { ...service, handleRpc: input => input.type === 'setup'
++      ? Promise.resolve({ target: 'linux', methods: ['list_apps'] }) : service.handleRpc(input) };
++  } }), /list_windows/);
++});
++
++test('validator rejects a service that cannot execute the SDK wire protocol', candidateTest, async () => {
++  const { validateRuntime, createNativeService } = await modules();
++  await assert.rejects(validateRuntime({ installDir, createService(options) {
++    const service = createNativeService(options);
++    return { ...service, handleRpc: input => input.type === 'execute'
++      ? Promise.reject(new Error('deliberately broken execute protocol')) : service.handleRpc(input) };
++  } }), /deliberately broken execute protocol/);
++});
++
++test('validator rejects swallowed host errors', candidateTest, async () => {
++  const { validateRuntime, createNativeService } = await modules();
++  await assert.rejects(validateRuntime({ installDir, createService(options) {
++    const service = createNativeService(options);
++    return { ...service, handleRpc: input => service.handleRpc(input).catch(() => []) };
++  } }), /Missing expected rejection/);
++});
++
++test('stage rejects a missing candidate Node before changing the plugin', t => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cua-stage-validation-'));
++  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
++  const result = spawnSync('bash', [path.join(__dirname, 'stage.sh')], {
++    encoding: 'utf8', env: { ...process.env, SCRIPT_DIR: repoRoot, INSTALL_DIR: root,
++      CODEX_COMPUTER_USE_BINARY_SOURCE: process.execPath, CODEX_COMPUTER_USE_COSMIC_BINARY_SOURCE: process.execPath },
++  });
++  assert.notEqual(result.status, 0);
++  assert.match(result.stderr, /candidate bundled Node runtime is missing/);
++  assert.equal(fs.existsSync(path.join(root, 'resources/plugins')), false);
++});
++
++test('validator sources survive two successive update-builder feature snapshots', candidateTest, t => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cua-validator-snapshots-'));
++  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
++  const config = path.join(root, 'features.json');
++  fs.writeFileSync(config, JSON.stringify({ enabled: ['computer-use-linux'] }));
++  const files = ['stage.sh', 'validate-runtime.mjs', 'validator.test.js', 'native.test.js', 'unified.test.js', 'host-service.test.js'];
++  let source = repoRoot;
++  for (let generation = 1; generation <= 2; generation += 1) {
++    const snapshot = path.join(root, `builder-${generation}`);
++    execFileSync('bash', ['-c', 'REPO_DIR=$1\nAPP_DIR=$3\n. "$REPO_DIR/scripts/lib/package-common.sh"\nstage_update_builder_linux_features_tree "$2"',
++      'snapshot', source, snapshot, installDir], {
++      encoding: 'utf8', timeout: 5000,
++      env: { ...process.env, CODEX_LINUX_FEATURES_CONFIG: config, CODEX_LINUX_FEATURES_ROOT: path.join(source, 'linux-features') },
++    });
++    for (const name of files) {
++      assert.deepEqual(fs.readFileSync(path.join(snapshot, 'linux-features/computer-use-linux', name)), fs.readFileSync(path.join(__dirname, name)));
++    }
++    execFileSync(process.execPath, [path.join(snapshot, 'linux-features/computer-use-linux/validate-runtime.mjs')], {
++      encoding: 'utf8', timeout: 6000, env: { ...process.env, INSTALL_DIR: installDir },
++    });
++    // Supply only the existing packaging helper dependencies for the next snapshot.
++    fs.mkdirSync(path.join(snapshot, 'scripts/lib'), { recursive: true });
++    for (const name of ['package-common.sh', 'linux-features.js']) {
++      fs.copyFileSync(path.join(source, 'scripts/lib', name), path.join(snapshot, 'scripts/lib', name));
++    }
++    source = snapshot;
++  }
++});
+--- a/scripts/patches/impl/computer-use.js
++++ b/scripts/patches/impl/computer-use.js
+@@ -153,61 +153,20 @@
+ };
+ 
+ function applyLinuxComputerUseFeaturePatch(currentSource) {
+-  const patchedFeaturePattern =
+-    /function [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,\{env:[A-Za-z_$][\w$]*=process\.env,platform:[A-Za-z_$][\w$]*=process\.platform\}=\{\}\)\{return [A-Za-z_$][\w$]*===`linux`\?\{\.\.\.[A-Za-z_$][\w$]*,computerUse:!0,computerUseNodeRepl:!0\}:/;
+-  const currentPatchedFeaturePattern =
+-    /let [A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*===`linux`\?\{\.\.\.[A-Za-z_$][\w$]*,computerUse:!0,computerUseNodeRepl:!0\}:[A-Za-z_$][\w$]*===`win32`&&[A-Za-z_$][\w$]*\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`\?\{\.\.\.[A-Za-z_$][\w$]*,computerUse:!0,computerUseNodeRepl:!0\}:[A-Za-z_$][\w$]*,/;
+-  const currentChainedPatchedFeaturePattern =
+-    /,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*===`linux`\?\{\.\.\.[A-Za-z_$][\w$]*,computerUse:!0,computerUseNodeRepl:!0\}:[A-Za-z_$][\w$]*===`win32`&&[A-Za-z_$][\w$]*\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`\?\{\.\.\.[A-Za-z_$][\w$]*,computerUse:!0,computerUseNodeRepl:!0\}:[A-Za-z_$][\w$]*,/;
+-  const windowsOnlyFeaturePattern =
+-    /function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),\{env:([A-Za-z_$][\w$]*)=process\.env,platform:([A-Za-z_$][\w$]*)=process\.platform\}=\{\}\)\{return \4!==`win32`\|\|\3\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE!==`1`\?\2:\{\.\.\.\2,computerUse:!0,computerUseNodeRepl:!0\}\}/g;
+-  const currentWindowsOnlyFeaturePattern =
+-    /let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)===`win32`&&([A-Za-z_$][\w$]*)\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`\?\{\.\.\.([A-Za-z_$][\w$]*),computerUse:!0,computerUseNodeRepl:!0\}:\4,/g;
+-  const chainedWindowsOnlyFeaturePattern =
+-    /,([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)===`win32`&&([A-Za-z_$][\w$]*)\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`\?\{\.\.\.([A-Za-z_$][\w$]*),computerUse:!0,computerUseNodeRepl:!0\}:\4,/g;
+-
+-  let changed = false;
+-  let patchedSource = currentSource.replace(
+-    windowsOnlyFeaturePattern,
+-    (_, fnName, featuresVar, envVar, platformVar) => {
+-      changed = true;
+-      return `function ${fnName}(${featuresVar},{env:${envVar}=process.env,platform:${platformVar}=process.platform}={}){return ${platformVar}===\`linux\`?{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}:${platformVar}!==\`win32\`||${envVar}.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE!==\`1\`?${featuresVar}:{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}}`;
+-    },
++  if (!currentSource.includes("CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE")) return currentSource;
++  const pattern = /function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),\{buildFlavor:([A-Za-z_$][\w$]*)=[^,{}]+,env:([A-Za-z_$][\w$]*)=[^,{}]+,platform:([A-Za-z_$][\w$]*)=[^,{}]+\}=\{\}\)\{let ([A-Za-z_$][\w$]*)=(?:\5===`linux`\?\{\.\.\.\2,computerUse:!0\}:)?\5===`win32`&&\4\.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===`1`\?\{\.\.\.\2,computerUse:!0\}:\2,/g;
++  const matches = [...currentSource.matchAll(pattern)];
++  if (matches.length !== 1) {
++    throw new Error("Linux Computer Use desktop feature gate drift: expected one current availability function");
++  }
++  const match = matches[0];
++  const [gate, , features, , , platform, result] = match;
++  if (gate.includes(`${platform}===\`linux\`?`)) return currentSource;
++  const patched = gate.replace(
++    `let ${result}=${platform}===\`win32\``,
++    `let ${result}=${platform}===\`linux\`?{...${features},computerUse:!0}:${platform}===\`win32\``,
+   );
+-  patchedSource = patchedSource.replace(
+-    currentWindowsOnlyFeaturePattern,
+-    (_, gateVar, platformVar, envVar, featuresVar) => {
+-      changed = true;
+-      return `let ${gateVar}=${platformVar}===\`linux\`?{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}:${platformVar}===\`win32\`&&${envVar}.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===\`1\`?{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}:${featuresVar},`;
+-    },
+-  );
+-  patchedSource = patchedSource.replace(
+-    chainedWindowsOnlyFeaturePattern,
+-    (_, gateVar, platformVar, envVar, featuresVar) => {
+-      changed = true;
+-      return `,${gateVar}=${platformVar}===\`linux\`?{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}:${platformVar}===\`win32\`&&${envVar}.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE===\`1\`?{...${featuresVar},computerUse:!0,computerUseNodeRepl:!0}:${featuresVar},`;
+-    },
+-  );
+-
+-  if (changed) {
+-    return patchedSource;
+-  }
+-
+-  if (
+-    patchedFeaturePattern.test(currentSource) ||
+-    currentPatchedFeaturePattern.test(currentSource) ||
+-    currentChainedPatchedFeaturePattern.test(currentSource)
+-  ) {
+-    return currentSource;
+-  }
+-
+-  if (currentSource.includes("CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE")) {
+-    console.warn(
+-      "WARN: Could not find Computer Use desktop feature gate — skipping Linux Computer Use feature patch",
+-    );
+-  }
+-
+-  return currentSource;
++  return currentSource.slice(0, match.index) + patched + currentSource.slice(match.index + gate.length);
+ }
+ 
+ function applyCurrentComputerUseHostPlatformContract(currentSource) {
