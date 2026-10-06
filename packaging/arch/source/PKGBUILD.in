@@ -8,7 +8,7 @@ url='https://github.com/wojciechsacewicz/niri-codex-computer-use'
 license=('MIT' 'GPL-3.0-or-later')
 depends=('niri' 'cairo' 'glib2' 'libinput' 'libpipewire' 'libxkbcommon' 'mesa' 'pango' 'pixman' 'seatd' 'systemd-libs' 'bash' 'python')
 makedepends=('git' 'rust' 'clang' 'pkgconf' 'libdisplay-info' 'libxrandr' 'libxft')
-checkdepends=('xorg-server-xvfb' 'xorg-xauth' 'xdotool' 'wtype' 'wl-clipboard' 'bubblewrap' 'dbus' 'gtk3' 'python-gobject' 'python-pillow')
+checkdepends=('xorg-server-xvfb' 'xorg-xauth' 'libxkbcommon-x11' 'xdotool' 'wtype' 'wl-clipboard' 'bubblewrap' 'dbus' 'gtk3' 'python-gobject' 'python-pillow')
 # Cargo retains niri's Rust LTO. GCC LTO in C wrappers cannot be linked by Rust's lld.
 options=('!strip' '!debug' '!lto')
 _project_revision='@PROJECT_REVISION@'

@@ -33,7 +33,7 @@ The companion updater handles our compositor, strict helper, session launcher, a
 
 1. Increment `packaging/arch/release.json` and the local `PKGBUILD` together. Update the changelog.
 2. Commit the reviewed integration, then run `make package-source`. The exported `PKGBUILD` and `.SRCINFO` point to that exact project commit. Publish the commit before sharing the recipe.
-3. Run the Arch source-build workflow. It builds the patched compositor and backend, runs isolated input/screenshot tests, and checks the package's actual launcher and source lock. PR jobs test their checkout through a temporary local source URL; the distributed recipe always uses the public repository.
+3. Run the Arch source-build workflow. It builds the patched compositor and backend, runs isolated input/screenshot tests, and checks the package's actual launcher and source lock. PR jobs test their checkout through a temporary local source URL; the distributed recipe always uses the public repository. Cargo download/build caches are keyed by the source pins, patches, compiler, and installed package versions. Native checks still run on every build.
 4. For Codex integration changes, build a desktop candidate, run its SDK checks, and rebuild using the sources embedded in its actual package.
 5. Test a real login and native CUA with representative apps. Check focus, pointer, clipboard, screenshots, and the visible agent cursor. Record what passed and what remains unsupported.
 6. Publish a stable `vMAJOR.MINOR.PATCH` release only after those checks. Prereleases do not reach the companion updater.

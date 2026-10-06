@@ -19,12 +19,26 @@ jobs:
     steps:
       - name: Install build and isolated test dependencies
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust clang python nodejs niri cairo glib2 libinput libpipewire libxkbcommon mesa pango pixman seatd libdisplay-info libxrandr libxft xorg-server-xvfb xorg-xauth xdotool wtype wl-clipboard bubblewrap dbus gtk3 python-gobject python-pillow
+          pacman -Syu --noconfirm --needed base-devel git rust clang python nodejs niri cairo glib2 libinput libpipewire libxkbcommon libxkbcommon-x11 mesa pango pixman seatd libdisplay-info libxrandr libxft xorg-server-xvfb xorg-xauth xdotool wtype wl-clipboard bubblewrap dbus gtk3 python-gobject python-pillow
           useradd --create-home --uid 1000 builder
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fingerprint the build environment
+        id: toolchain
+        run: |
+          { rustc -Vv; pacman -Q; } > "$RUNNER_TEMP/nccu-toolchain.txt"
+          printf 'digest=%s\n' "$(sha256sum "$RUNNER_TEMP/nccu-toolchain.txt" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+            .local/cargo-cache
+          key: arch-native-${{ steps.toolchain.outputs.digest }}-${{ hashFiles('sources.lock.json', 'patches/**/*.patch') }}
       - name: Build and test as a normal user
         env:
           NCCU_JOBS: '2'
+          NCCU_CARGO_CACHE: ${{ github.workspace }}/.local/cargo-cache
         run: |
           chown -R builder:builder "$GITHUB_WORKSPACE"
+          chown -R builder:builder /home/builder/.cargo 2>/dev/null || true
           runuser -u builder -- bash scripts/ci-arch.sh

@@ -6,7 +6,7 @@ This is an early integration for x86_64 CachyOS with systemd. The tested source 
 
 Build dependencies include Git, Rust/Cargo, pkg-config, clang, the niri development libraries, and the dependencies listed in the community desktop builder. On Arch, start with `base-devel`, `git`, `rust`, `clang`, `libdisplay-info`, `libinput`, `libpipewire`, `libxkbcommon`, `pango`, `cairo`, `mesa`, and `seatd`. Install missing packages through your normal CachyOS update process.
 
-Native checks also need `xorg-server-xvfb`, `xorg-xauth`, `xdotool`, `wtype`, `wl-clipboard`, `bubblewrap`, `dbus`, `gtk3`, `python-gobject`, and `python-pillow`. Use a Python interpreter that can import `gi` and `PIL`.
+Native checks also need `xorg-server-xvfb`, `xorg-xauth`, `libxkbcommon-x11`, `xdotool`, `wtype`, `wl-clipboard`, `bubblewrap`, `dbus`, `gtk3`, `python-gobject`, and `python-pillow`. Use a Python interpreter that can import `gi` and `PIL`.
 
 ```sh
 make prepare
