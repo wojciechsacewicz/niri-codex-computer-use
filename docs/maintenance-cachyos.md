@@ -11,3 +11,5 @@ Before a release, verify the sources embedded in the actual package and rebuild 
 Keep user-specific paths, logs, process IDs, checkpoints, and built packages in ignored `.local/`, `build/`, or `dist/` directories. Publish source pins, patches, test code, and controlled fixture images. Keep original notices and licenses when importing changes.
 
 CI checks patch application, script syntax, and adapter contracts. It does not replace the release checks that need a compiled compositor and the actual Codex SDK. Dependabot keeps the pinned GitHub Actions under review.
+
+The desktop builder is pinned to public revision `49d5bc1`, with Helium support carried as an explicit project patch. This reproduces the accepted local source tree without depending on an unpublished commit. Newer upstream revisions need patch refresh and the same verification before adoption.

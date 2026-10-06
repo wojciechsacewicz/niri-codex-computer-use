@@ -1,0 +1,188 @@
+diff --git a/README.md b/README.md
+index eb9dc2c..5280a84 100644
+--- a/README.md
++++ b/README.md
+@@ -249,6 +249,7 @@ requirements, known limitations, configuration, and tests.
+ | `shallow-repository-watches` | Avoid recursive main-thread walks for transient repository previews | [Docs](linux-features/shallow-repository-watches/README.md) |
+ | `shared-app-server-socket` | Share one protocol-transparent Unix app-server socket | [Docs](linux-features/shared-app-server-socket/README.md) |
+ | `thorium-chrome-plugin` | Add Thorium to the official bundled Chrome integration | [Docs](linux-features/thorium-chrome-plugin/README.md) |
++| `helium-browser-support` | Detect Helium extension profiles and prefer Helium for Linux browser actions | [Docs](linux-features/helium-browser-support/README.md) |
+ | `tray-usage` | Show usage remaining in the Linux system-tray menu | [Docs](linux-features/tray-usage/README.md) |
+ | `ui-tweaks` | Optional visual and interaction customizations | [Docs](linux-features/ui-tweaks/README.md) |
+ 
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 55d4d41..6e8fced 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -232,6 +232,7 @@ Nix 用户应从 profile、Home Manager 配置或 NixOS module 中删除该包
+ | `shallow-repository-watches` | 避免临时 repo preview 在主线程递归遍历 | [文档](linux-features/shallow-repository-watches/README.md) |
+ | `shared-app-server-socket` | 共享 protocol-transparent Unix app-server socket | [文档](linux-features/shared-app-server-socket/README.md) |
+ | `thorium-chrome-plugin` | 为官方 Chrome integration 添加 Thorium | [文档](linux-features/thorium-chrome-plugin/README.md) |
++| `helium-browser-support` | 检测 Helium 扩展配置，并优先使用 Helium 执行 Linux 浏览器操作 | [文档](linux-features/helium-browser-support/README.md) |
+ | `tray-usage` | 在 Linux 系统托盘菜单显示剩余用量 | [文档](linux-features/tray-usage/README.md) |
+ | `ui-tweaks` | 可选 UI 与交互自定义 | [文档](linux-features/ui-tweaks/README.md) |
+ 
+diff --git a/linux-features/helium-browser-support/README.md b/linux-features/helium-browser-support/README.md
+new file mode 100644
+index 0000000..dc550d4
+--- /dev/null
++++ b/linux-features/helium-browser-support/README.md
+@@ -0,0 +1,21 @@
++# Helium browser support
++
++Enable `helium-browser-support` to let ChatGPT Community's Linux browser
++settings find the ChatGPT extension in Helium's `net.imput.helium` profile.
++Helium is preferred for Chrome-family URL and extension-settings actions.
++The integration retains the upstream Chrome family name and extension IDs.
++
++The feature patches the two shared Electron browser registries during a build.
++It preserves other browsers and fails the build if the registry contract changes.
++It does not mark an extension installed without checking its real profile files.
++Browser Control remains a separate integration.
++
++```json
++{ "enabled": ["computer-use-linux", "helium-browser-support"] }
++```
++
++Pass the same feature configuration to codex-update-manager through
++`feature_config_path` to retain the feature in updates. Restart the app after
++installing the rebuilt package.
++
++Run `node --test linux-features/helium-browser-support/test.js`.
+diff --git a/linux-features/helium-browser-support/feature.json b/linux-features/helium-browser-support/feature.json
+new file mode 100644
+index 0000000..e868f78
+--- /dev/null
++++ b/linux-features/helium-browser-support/feature.json
+@@ -0,0 +1,7 @@
++{
++  "id": "helium-browser-support",
++  "title": "Helium Browser Support",
++  "description": "Recognize Helium profiles and prefer Helium for Linux Chromium browser actions.",
++  "defaultEnabled": false,
++  "entrypoints": { "patchDescriptors": "./patch.js" }
++}
+diff --git a/linux-features/helium-browser-support/patch.js b/linux-features/helium-browser-support/patch.js
+new file mode 100644
+index 0000000..ca792b1
+--- /dev/null
++++ b/linux-features/helium-browser-support/patch.js
+@@ -0,0 +1,64 @@
++"use strict";
++
++const fs = require("node:fs");
++const path = require("node:path");
++
++// The settings checker and URL launcher consume this shared registry. Patch
++// its Linux Chrome-family entry, preserving upstream extension IDs and the
++// Windows/macOS entries. Helium uses the Chrome extension protocol.
++const LINUX_ENTRY = /linux:\{installations:\[(.*?)\],nativeMessagingManifestDirectories:\[(.*?)\],processNames:\[(.*?)\],userDataDirectorySegments:\[(.*?)\]\}/g;
++const PROFILE = "net.imput.helium";
++
++function patchSource(source) {
++  const matches = [...source.matchAll(LINUX_ENTRY)].filter((match) =>
++    match[4].replaceAll('"', '`') === '`.config`,`google-chrome`',
++  );
++  if (matches.length !== 1) {
++    throw new Error(`Expected one Linux Chrome registry entry; found ${matches.length}`);
++  }
++  const match = matches[0];
++  const quote = match[1].includes('`google-chrome`') ? '`' : '"';
++  const q = (value) => `${quote}${value}${quote}`;
++  const installation = `{commands:[${q("helium-browser")},${q("helium")}],userDataDirName:${q(PROFILE)}}`;
++  const manifest = q(`.config/${PROFILE}/NativeMessagingHosts`);
++  const processes = `${q("helium")},${q("helium-browser")}`;
++  const alreadyPatched = match[1].startsWith(`${installation},`) &&
++    match[2].startsWith(`${manifest},`) && match[3].endsWith(`,${processes}`);
++  if (alreadyPatched) return { source, changed: false };
++  if (match[0].includes(PROFILE) || match[0].includes(q("helium"))) {
++    throw new Error("Incomplete Helium browser registry patch");
++  }
++  if (!match[1].startsWith(`{commands:[${q("google-chrome")},${q("google-chrome-stable")}]`) ||
++      !match[2].includes(q(".config/google-chrome/NativeMessagingHosts")) ||
++      match[3] !== q("chrome")) {
++    throw new Error("Linux Chrome registry contract changed");
++  }
++  const replacement = `linux:{installations:[${installation},${match[1]}],nativeMessagingManifestDirectories:[${manifest},${match[2]}],processNames:[${match[3]},${processes}],userDataDirectorySegments:[${match[4]}]}`;
++  return { source: source.slice(0, match.index) + replacement + source.slice(match.index + match[0].length), changed: true };
++}
++
++function patchApp(extractedDir) {
++  const buildDir = path.join(extractedDir, ".vite", "build");
++  const candidates = fs.readdirSync(buildDir).filter((name) => name.endsWith(".js"))
++    .map((name) => ({ file: path.join(buildDir, name), source: fs.readFileSync(path.join(buildDir, name), "utf8") }))
++    .filter(({ source }) => source.includes("userDataDirName:") && source.includes("google-chrome-for-testing"));
++  if (candidates.length !== 2) throw new Error(`Expected two shared browser registries; found ${candidates.length}`);
++  // Validate every target before writing any of them.
++  const results = candidates.map((candidate) => ({ ...candidate, result: patchSource(candidate.source) }));
++  for (const { file, result } of results) if (result.changed) fs.writeFileSync(file, result.source);
++  return { matched: results.length, changed: results.filter(({ result }) => result.changed).length,
++    targets: results.map(({ file }) => path.relative(extractedDir, file)) };
++}
++
++module.exports = {
++  patchSource,
++  patchApp,
++  descriptors: [{
++    id: "desktop-browser-registry",
++    phase: "extracted-app:pre-webview",
++    order: 20510,
++    ciPolicy: "opt-in",
++    apply: patchApp,
++    status: (result) => result.changed > 0 ? "applied" : "already-applied",
++  }],
++};
+diff --git a/linux-features/helium-browser-support/test.js b/linux-features/helium-browser-support/test.js
+new file mode 100644
+index 0000000..462c778
+--- /dev/null
++++ b/linux-features/helium-browser-support/test.js
+@@ -0,0 +1,48 @@
++"use strict";
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const os = require("node:os");
++const path = require("node:path");
++const vm = require("node:vm");
++const test = require("node:test");
++const { patchSource, patchApp } = require("./patch.js");
++
++const original = '({linux:{installations:[{commands:[`google-chrome`,`google-chrome-stable`],userDataDirName:`google-chrome`},{commands:[`chromium`,`chromium-browser`],userDataDirName:`chromium`},{commands:[`google-chrome-for-testing`],userDataDirName:`google-chrome-for-testing`}],nativeMessagingManifestDirectories:[`.config/google-chrome/NativeMessagingHosts`,`.config/chromium/NativeMessagingHosts`],processNames:[`chrome`],userDataDirectorySegments:[`.config`,`google-chrome`]},macos:{bundleId:`com.google.Chrome`}})';
++
++test("adds real Helium locations without replacing Chrome or other platforms", () => {
++  const before = vm.runInNewContext(original);
++  const after = vm.runInNewContext(patchSource(original).source);
++  assert.equal(after.linux.installations[0].userDataDirName, "net.imput.helium");
++  assert.equal(after.linux.installations[0].commands[0], "helium-browser");
++  assert.equal(JSON.stringify(after.linux.installations.slice(1)), JSON.stringify(before.linux.installations));
++  assert.equal(JSON.stringify(after.macos), JSON.stringify(before.macos));
++  assert.equal(after.linux.nativeMessagingManifestDirectories[0], ".config/net.imput.helium/NativeMessagingHosts");
++  assert.equal(JSON.stringify(after.linux.processNames), '["chrome","helium","helium-browser"]');
++});
++
++test("idempotent for both official string quote styles", () => {
++  for (const source of [original, original.replaceAll('`', '"')]) {
++    const patched = patchSource(source);
++    assert.equal(patched.changed, true);
++    assert.deepEqual(patchSource(patched.source), { source: patched.source, changed: false });
++  }
++});
++
++test("rejects missing, duplicate, changed and partial registry contracts", () => {
++  for (const source of ["", original + original, original.replace('processNames:[`chrome`]', 'processNames:[`other`]'), original.replace('userDataDirName:`chromium`', 'userDataDirName:`net.imput.helium`')]) {
++    assert.throws(() => patchSource(source));
++  }
++});
++
++test("validates both app targets before writing and rejects incomplete inventories", () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "helium-feature-test-"));
++  try {
++    const dir = path.join(root, ".vite", "build"); fs.mkdirSync(dir, { recursive: true });
++    const a = path.join(dir, "shared.js"), b = path.join(dir, "worker.js");
++    fs.writeFileSync(a, original); assert.throws(() => patchApp(root));
++    fs.writeFileSync(b, original.replace('processNames:[`chrome`]', 'processNames:[`other`]'));
++    assert.throws(() => patchApp(root)); assert.equal(fs.readFileSync(a, "utf8"), original);
++    fs.writeFileSync(b, original);
++    assert.equal(patchApp(root).changed, 2); assert.equal(patchApp(root).changed, 0);
++  } finally { fs.rmSync(root, { recursive: true, force: true }); }
++});
