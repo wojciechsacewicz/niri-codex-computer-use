@@ -42,7 +42,7 @@ There is no stable release yet. The package and isolated tests do not establish 
 
 ## Diagnostics and rollback
 
-`niri-codex-computer-use doctor` reads package and systemd state without launching anything. Exit code 0 means the patched session has the expected configuration, 1 means an installation or service error, and 2 means activation is pending. None of these codes proves CUA input passed.
+`niri-codex-computer-use doctor` reads package and systemd state without launching anything. Exit code 0 means the patched session has the expected configuration, 1 means an installation or service error, and 2 means activation is pending. The diagnostic also checks the companion binaries for missing shared libraries. A library ABI change is reported as a rebuild requirement, including when the stock session is active. The updater does not report an ABI-broken installation as up to date. None of these codes proves CUA input passed.
 
 Keep stock niri installed. Its login session is the compositor rollback. Keep the accepted companion archive and the saved Codex package when validating an update. Reinstall them through pacman if a release regresses.
 

@@ -46,8 +46,12 @@ class DoctorTests(unittest.TestCase):
         self.system.read_text.side_effect = lambda path: self.texts[path]
         self.system.read_exe.side_effect = lambda pid: self.executables[pid]
         self.system.query.side_effect = self.query
+        self.missing_libraries = []
 
     def query(self, command):
+        if command[0] == '/usr/bin/ldd':
+            output = '\n'.join(name + ' => not found' for name in self.missing_libraries)
+            return subprocess.CompletedProcess(command, 0, output, '')
         if command[0] == '/usr/bin/pacman':
             name = command[2]
             if name not in self.packages:
@@ -231,11 +235,20 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(commands, [
             ['/usr/bin/pacman', '-Q', 'niri-codex-computer-use'],
             ['/usr/bin/pacman', '-Q', 'codex-desktop'],
+            ['/usr/bin/ldd', doctor.PATCHED_NIRI],
+            ['/usr/bin/ldd', '/usr/lib/niri-codex-computer-use/bin/codex-computer-use-linux'],
             ['/usr/bin/systemctl', '--user', 'show', 'niri.service',
              '--property=LoadState,ActiveState,FragmentPath,MainPID'],
             ['/usr/bin/systemctl', '--user', 'show', 'niri-codex.service',
              '--property=LoadState,ActiveState,FragmentPath,MainPID'],
         ])
+
+    def test_missing_system_library_is_error_even_in_stock_session(self):
+        self.stock_session()
+        self.missing_libraries = ['libdisplay-info.so.3']
+        report = doctor.diagnose(self.system)
+        self.assert_error(report, 'needs a rebuild')
+        self.assertIn('libdisplay-info.so.3', report['files']['compositor']['libraries']['missing'])
 
     def test_real_query_uses_timeout_and_no_shell(self):
         with patch.object(doctor.subprocess, 'run') as run:

@@ -6,7 +6,7 @@ arch=('x86_64')
 url='https://github.com/wojciechsacewicz/niri-codex-computer-use'
 license=('MIT' 'GPL-3.0-or-later')
 depends=('niri' 'cairo' 'glib2' 'libinput' 'libpipewire' 'libxkbcommon' 'mesa' 'pango' 'pixman' 'seatd' 'systemd-libs' 'bash' 'python')
-options=('!strip' '!debug')
+options=('!strip' '!debug' '!lto')
 # Developer packaging of previously tested build outputs.
 package() {
     : "${NCCU_PROJECT_ROOT:?Set NCCU_PROJECT_ROOT to the reviewed project checkout}"

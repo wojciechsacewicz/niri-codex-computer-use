@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ import urllib.request
 REPOSITORY = 'wojciechsacewicz/niri-codex-computer-use'
 PACKAGE = 'niri-codex-computer-use'
 DESKTOP = Path('/opt/codex-desktop')
+inspect_libraries = runpy.run_path(str(Path(__file__).with_name('runtime-health.py')))['inspect_libraries']
 
 
 def run(*command, **kwargs):
@@ -42,7 +44,7 @@ def latest_release():
     if release.get('draft') or release.get('prerelease'):
         raise ValueError('The latest release is not a stable published release.')
     tag = release['tag_name']
-    if not re.fullmatch(r'v[0-9]+(?:\.[0-9]+)+', tag):
+    if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
         raise ValueError('Release tag must use vMAJOR.MINOR.PATCH naming.')
     commit = github('/commits/' + urllib.parse.quote(tag, safe=''))['sha']
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
@@ -72,6 +74,15 @@ def needs_update(installed, release):
     comparison = subprocess.check_output(['vercmp', release['package_version'], installed],
                                          text=True, timeout=10).strip()
     return int(comparison) > 0
+
+
+def assert_installed_libraries():
+    for name in ('niri', 'codex-computer-use-linux'):
+        state = inspect_libraries(Path('/usr/lib') / PACKAGE / 'bin' / name)
+        if state['error'] or state['missing']:
+            raise ValueError(f'{name} requires a compatible rebuild after a system library update: '
+                             f'{state["error"] or ", ".join(state["missing"])}. '
+                             'Use stock Niri until a verified companion build is available.')
 
 
 def verify_installed_desktop(source):
@@ -128,9 +139,11 @@ def main():
         installed = installed_version()
         release = latest_release()
         if release is None:
+            assert_installed_libraries()
             print('No stable GitHub release is published. The installed package is unchanged.')
             return 0
         if not needs_update(installed, release):
+            assert_installed_libraries()
             print(f'Installed {installed}; GitHub {release["tag"]}. No upgrade or downgrade is needed.')
             return 0
         print(f'Available: {release["tag"]}, exact source {release["revision"]}.', flush=True)

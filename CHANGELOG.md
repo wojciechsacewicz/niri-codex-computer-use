@@ -8,5 +8,7 @@
 - Add GitHub stable-release updates and a user Topgrade drop-in.
 - Add read-only installation/session diagnostics and stable/development upstream reports.
 - Add a clean Arch source-build workflow with isolated background-input tests.
+- Disable GCC LTO for C wrappers while retaining Cargo's Rust LTO.
+- Detect missing shared libraries after system updates.
 
 Real companion login and native CUA app acceptance remain pending. This version is not a stable release.

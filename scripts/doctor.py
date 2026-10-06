@@ -11,11 +11,13 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 
 
 PACKAGE = 'niri-codex-computer-use'
 CHECKOUT = Path(__file__).resolve().parents[1]
+inspect_libraries = runpy.run_path(str(Path(__file__).with_name('runtime-health.py')))['inspect_libraries']
 PATCHED_NIRI = f'/usr/lib/{PACKAGE}/bin/niri'
 STOCK_NIRI = '/usr/bin/niri'
 INSTALLED_LOCK = f'/usr/share/{PACKAGE}/sources.lock.json'
@@ -142,6 +144,16 @@ def diagnose(system=None):
                     errors.append(f'Installed {role} has unexpected {key}: {entry[key]}')
             except (OSError, UnicodeError) as exc:
                 errors.append(f'Cannot read {entry["path"]}: {exc}')
+
+    for role in ('compositor', 'backend'):
+        entry = report['files'].get(role)
+        if entry and entry['exists']:
+            entry['libraries'] = inspect_libraries(entry['path'], system.query)
+            libraries = entry['libraries']
+            if libraries['missing']:
+                errors.append(f'{role} needs a rebuild after a system library update: {", ".join(libraries["missing"])}')
+            if libraries['error']:
+                errors.append(f'Cannot inspect {role} libraries: {libraries["error"]}')
 
     locks = report['source_lock']
     for name, path in (('installed', INSTALLED_LOCK),

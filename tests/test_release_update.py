@@ -19,6 +19,16 @@ spec.loader.exec_module(topgrade)
 
 
 class ReleaseUpdateTests(unittest.TestCase):
+    def setUp(self):
+        healthy = patch.object(updater, 'inspect_libraries', return_value={'missing': [], 'error': None})
+        healthy.start()
+        self.addCleanup(healthy.stop)
+
+    def test_broken_library_is_not_reported_as_up_to_date(self):
+        with patch.object(updater, 'inspect_libraries', return_value={'missing': ['libdisplay-info.so.3'], 'error': None}):
+            with self.assertRaisesRegex(ValueError, 'rebuild'):
+                updater.assert_installed_libraries()
+
     def test_missing_desktop_helper_stops_compatibility_check(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(updater, 'DESKTOP', Path(directory)), \
              patch.object(updater, 'run') as run:
