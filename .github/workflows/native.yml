@@ -15,7 +15,7 @@ jobs:
     container:
       image: archlinux:base-devel
       # The test backend creates its own unprivileged namespaces inside this container.
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined
     steps:
       - name: Install build and isolated test dependencies
         run: |

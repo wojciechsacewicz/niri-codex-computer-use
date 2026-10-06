@@ -116,7 +116,9 @@ def build_release(release, cache):
         '--output', str(recipe_directory), cwd=directory)
     # makepkg runs prepare, build, check and the evidence gate in package().
     run('makepkg', '--noconfirm', '--log', cwd=recipe_directory,
-        env={**os.environ, 'NCCU_JOBS': os.environ.get('NCCU_JOBS', '2')}, preexec_fn=lambda: os.nice(10))
+        env={**os.environ, 'NCCU_JOBS': os.environ.get('NCCU_JOBS', '2'),
+             'NCCU_CARGO_CACHE': os.environ.get('NCCU_CARGO_CACHE', str(cache / 'cargo-cache'))},
+        preexec_fn=lambda: os.nice(10))
     packages = subprocess.check_output(['makepkg', '--packagelist'], cwd=recipe_directory, text=True).splitlines()
     if len(packages) != 1:
         raise ValueError('Expected exactly one companion package.')

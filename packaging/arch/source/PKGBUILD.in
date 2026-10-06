@@ -17,6 +17,7 @@ sha256sums=('SKIP')
 
 prepare() {
     cd "$srcdir/nccu"
+    bash scripts/check-native-runtime.sh
     python3 scripts/prepare-sources.py all
 }
 

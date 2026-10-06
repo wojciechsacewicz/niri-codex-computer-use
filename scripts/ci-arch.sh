@@ -3,6 +3,7 @@ set -Eeuo pipefail
 [[ "$(id -u)" != 0 ]] || { echo 'Run the build as an unprivileged user' >&2; exit 1; }
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+bash scripts/check-native-runtime.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/export-arch-recipe.py
 cd "$root/dist/arch-source"
