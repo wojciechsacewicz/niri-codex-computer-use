@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.error
@@ -16,6 +17,7 @@ import urllib.request
 
 REPOSITORY = 'wojciechsacewicz/niri-codex-computer-use'
 PACKAGE = 'niri-codex-computer-use'
+DESKTOP = Path('/opt/codex-desktop')
 
 
 def run(*command, **kwargs):
@@ -72,6 +74,20 @@ def needs_update(installed, release):
     return int(comparison) > 0
 
 
+def verify_installed_desktop(source):
+    helper = DESKTOP / 'resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux'
+    node = DESKTOP / 'resources/cua_node/bin/node'
+    xvfb = shutil.which('Xvfb')
+    if not helper.is_file() or not node.is_file() or not xvfb:
+        raise ValueError('The installed native Codex helper, bundled Node, and Xvfb are required for update compatibility checks.')
+    environment = {**os.environ, 'INSTALL_DIR': str(DESKTOP)}
+    run(str(node), '--test', str(source / 'build/codex-desktop-linux/linux-features/computer-use-linux/validator.test.js'),
+        env=environment)
+    # Exercise the installed app's helper against the candidate compositor on a private display.
+    run('python3', str(source / 'tests/backend-mcp-check.py'), '--niri', str(source / '.local/outputs/niri'),
+        '--xvfb', xvfb, '--backend', str(helper), '--output', str(source / '.local/checks/installed-desktop'))
+
+
 def build_release(release, cache):
     directory = Path(tempfile.mkdtemp(prefix=release['revision'] + '-', dir=cache))
     print(f'Building in {directory}. Previous attempts are preserved.', flush=True)
@@ -88,7 +104,8 @@ def build_release(release, cache):
     run('python3', str(directory / 'scripts/export-arch-recipe.py'), '--revision', actual,
         '--output', str(recipe_directory), cwd=directory)
     # makepkg runs prepare, build, check and the evidence gate in package().
-    run('makepkg', '--noconfirm', cwd=recipe_directory)
+    run('makepkg', '--noconfirm', '--log', cwd=recipe_directory,
+        env={**os.environ, 'NCCU_JOBS': os.environ.get('NCCU_JOBS', '2')}, preexec_fn=lambda: os.nice(10))
     packages = subprocess.check_output(['makepkg', '--packagelist'], cwd=recipe_directory, text=True).splitlines()
     if len(packages) != 1:
         raise ValueError('Expected exactly one companion package.')
@@ -96,6 +113,7 @@ def build_release(release, cache):
     expected = f"{PACKAGE} {metadata['pkgver']}-{metadata['pkgrel']}"
     if subprocess.check_output(['pacman', '-Qp', str(package)], text=True, timeout=10).strip() != expected:
         raise ValueError('Built package identity does not match its release.')
+    verify_installed_desktop(recipe_directory / 'src/nccu')
     return package
 
 

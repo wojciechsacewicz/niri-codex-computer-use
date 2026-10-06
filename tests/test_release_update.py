@@ -19,6 +19,31 @@ spec.loader.exec_module(topgrade)
 
 
 class ReleaseUpdateTests(unittest.TestCase):
+    def test_missing_desktop_helper_stops_compatibility_check(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(updater, 'DESKTOP', Path(directory)), \
+             patch.object(updater, 'run') as run:
+            with self.assertRaises(ValueError):
+                updater.verify_installed_desktop(Path(directory))
+            run.assert_not_called()
+
+    def test_desktop_helper_is_tested_on_private_candidate_compositor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            helper = base / 'resources/plugins/openai-bundled/plugins/unified-computer-use/bin/codex-computer-use-linux'
+            node = base / 'resources/cua_node/bin/node'
+            for file in (helper, node):
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+            source = base / 'source'
+            with patch.object(updater, 'DESKTOP', base), patch.object(updater.shutil, 'which', return_value='/usr/bin/Xvfb'), \
+                 patch.object(updater, 'run') as run:
+                updater.verify_installed_desktop(source)
+            calls = run.call_args_list
+            self.assertEqual(calls[0].kwargs['env']['INSTALL_DIR'], str(base))
+            self.assertIn(str(helper), calls[1].args)
+            self.assertIn(str(source / '.local/outputs/niri'), calls[1].args)
+            self.assertNotIn('pkexec', calls[0].args + calls[1].args)
+
     def test_absent_release_is_normal(self):
         error = urllib.error.HTTPError('test', 404, 'Not found', None, None)
         with patch.object(updater, 'github', side_effect=error):
