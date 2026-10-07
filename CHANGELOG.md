@@ -9,6 +9,12 @@
 - Refuse ambiguous app launches instead of binding an unrelated new window.
 - Correct Unicode input classification for Helium, Chromium app windows, and Electron applications.
 - Exercise the native JavaScript API through an isolated compositor and real backend.
+- Match Linux SDK rules for existing-window binding, scroll distances, click options, and mutation results.
+- Preserve available inventory results if native or browser discovery fails.
+- Add existing X11 window checks without accessibility, plus local rendering and window-lifecycle stress checks.
+- Refuse unsupported X11 Unicode before sending partial text.
+- Re-enter pointer delivery after the agent cursor expires.
+- Add a local public-file guard for private paths, session data, credentials, and image metadata.
 
 The real companion login, GTK input, and vision-only Chromium control passed. Concurrent input to two XWayland apps remains unsupported. A real session also crashed in the installed compositor; the cause remains under investigation. The new API and cursor changes have not yet been installed or validated in a real session. Cursor changes require activating the updated compositor at the next login.
 

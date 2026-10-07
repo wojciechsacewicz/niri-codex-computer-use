@@ -2,7 +2,7 @@
 
 Let Codex work in a background window while you keep using your computer.
 
-Our goal is computer use on **CachyOS and niri** with a visible agent cursor, independent input, and no interruption to your mouse or keyboard. Codex should be able to click, type, scroll, drag, and take window screenshots without switching your active window or workspace.
+Our goal is computer use on **CachyOS and niri** with a visible agent cursor, independent input, and no interruption to your mouse or keyboard. Codex should be able to work with apps you have already opened: click, type, scroll, drag, and take window screenshots without switching your active window or workspace. The target does not require separate agent displays or changes to how you launch your apps.
 
 ## What we want to get right
 
@@ -21,6 +21,8 @@ This is an early project. Our niri 26.04 build and Codex backend pass isolated G
 ![Human and agent test windows with separate themed cursors](docs/images/background-cursor.png)
 
 The current Codex SDK checks and two successive update-source snapshots also pass. We have built separate CachyOS packages. A first-login launcher bug was found and fixed. A real companion login and native GTK input have now passed. Chromium also passed image-based control with no accessible controls, including fresh screenshots and input on a hidden workspace. Concurrent input to two XWayland apps remains unsupported because they share one Wayland client. This is not ready to promise compatibility with every application. A real session has also ended in a compositor crash. Its cause is still under investigation, so stability is not yet established. The new API and cursor changes are candidates awaiting installation and session validation.
+
+Existing X11 windows are also tested without accessibility. Clicking, ASCII text, dragging, and hidden-window images pass. Non-ASCII text is safely refused, and an initial scroll still fails. The X11 suite reports these gaps as failures.
 
 The project stores patches and source pins, not a copy of niri. Source builds fetch the reviewed upstream revision into an ignored build directory. GitHub release updates and a Topgrade drop-in are provided. No stable release is published yet, so the updater leaves the installed version alone.
 

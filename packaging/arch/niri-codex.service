@@ -9,4 +9,5 @@ Before=xdg-desktop-autostart.target
 [Service]
 Slice=session.slice
 Type=notify
+CoredumpFilter=default private-file-backed
 ExecStart=/usr/lib/niri-codex-computer-use/bin/niri --session

@@ -1,0 +1,180 @@
+--- a/src/agent_input.rs
++++ b/src/agent_input.rs
+@@ -14,9 +14,10 @@
+ use niri_ipc::{AgentActivityKind, AgentEvent, AgentScreenshotInfo, AgentUnicodeInput};
+ use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, WindowSurfaceType};
+ use smithay::input::keyboard::{xkb, Keycode, KeymapFile};
++use smithay::input::pointer::{PointerTarget, RelativeMotionEvent};
+ use smithay::reexports::wayland_server::backend::ClientId;
+ use smithay::reexports::wayland_server::protocol::wl_keyboard::{KeyState, KeymapFormat};
+-use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis, ButtonState};
++use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+ use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
+ use std::cell::RefCell;
+@@ -383,6 +384,21 @@
+         Ok(tint)
+     }
+ 
++    fn motion_delta(
++        &self,
++        window_id: u64,
++        position: Point<f64, Logical>,
++        surface_changed: bool,
++    ) -> (bool, Point<f64, Logical>) {
++        let previous = self.cursors.get(&window_id).map(|cursor| cursor.to);
++        let reenter = surface_changed || previous.is_none();
++        let delta = previous
++            .filter(|_| !reenter)
++            .map(|previous| position - previous)
++            .unwrap_or_else(|| Point::from((0., 0.)));
++        (reenter, delta)
++    }
++
+     fn move_cursor(
+         &mut self,
+         window_id: u64,
+@@ -505,6 +521,26 @@
+ }
+ 
+ impl State {
++    fn agent_is_satellite_client(&self, client: &Client) -> Result<bool, String> {
++        let unidentified = || String::from("cannot identify text target; no input was sent");
++        let credentials = client.get_credentials(&self.niri.display_handle)
++            .map_err(|_| unidentified())?;
++        let executable = std::fs::read_link(format!("/proc/{}/exe", credentials.pid))
++            .map_err(|_| unidentified())?;
++        let config = self.niri.config.borrow();
++        let path = std::path::Path::new(&config.xwayland_satellite.path);
++        let expanded = crate::utils::expand_home(path).map_err(|_| unidentified())?;
++        let path = expanded.as_deref().unwrap_or(path);
++        let configured = if path.components().count() > 1 || path.is_absolute() {
++            path.canonicalize().ok()
++        } else {
++            std::env::var_os("PATH").and_then(|paths| {
++                std::env::split_paths(&paths).find_map(|dir| dir.join(path).canonicalize().ok())
++            })
++        }.ok_or_else(unidentified)?;
++        Ok(configured == executable)
++    }
++
+     pub fn agent_input(
+         &mut self,
+         window_id: u64,
+@@ -536,6 +572,17 @@
+             .is_some_and(|s| same_client(&s, &client))
+         {
+             return Err(String::from("target client holds the real keyboard focus"));
++        }
++        // Preflight the entire request before keymap, pointer or keyboard delivery.
++        // X11 clients interpret keycodes through a shared XKB map; restoring the
++        // temporary map before their lookup can corrupt non-ASCII text.
++        let non_ascii_text = events.iter().any(|event| {
++            matches!(event, AgentEvent::Text { text, .. } if !text.is_ascii())
++        });
++        if non_ascii_text && self.agent_is_satellite_client(&client)? {
++            return Err(String::from(
++                "X11 non-ASCII text is unsupported in background mode; no input was sent",
++            ));
+         }
+         let tint = self
+             .niri
+@@ -617,7 +664,11 @@
+                     let local = point - loc.to_f64();
+ 
+                     let entered = self.niri.agent_input.pointer.clone();
+-                    let reenter = pointer_stale || entered.as_ref() != Some(&surface);
++                    let (reenter, delta) = self.niri.agent_input.motion_delta(
++                        window_id,
++                        Point::from((x, y)),
++                        pointer_stale || entered.as_ref() != Some(&surface),
++                    );
+                     pointer_stale = false;
+                     for ptr in pointer.client_pointers(&client) {
+                         if reenter {
+@@ -626,6 +677,21 @@
+                             }
+                             ptr.enter(self.niri.agent_input.next_serial(), &surface, local.x, local.y);
+                         }
++                    }
++                    // Match ordinary mouse delivery: XWayland's relative slave carries
++                    // wheel/buttons, while wl_pointer.motion supplies rootless coordinates.
++                    let seat = self.niri.seat.clone();
++                    <WlSurface as PointerTarget<State>>::relative_motion(
++                        &surface,
++                        &seat,
++                        self,
++                        &RelativeMotionEvent {
++                            delta,
++                            delta_unaccel: delta,
++                            utime: get_monotonic_time().as_micros() as u64,
++                        },
++                    );
++                    for ptr in pointer.client_pointers(&client) {
+                         ptr.motion(now_ms(), local.x, local.y);
+                         if ptr.version() >= 5 {
+                             ptr.frame();
+@@ -687,11 +753,30 @@
+                         return Err(String::from("Axis before Motion"));
+                     }
+                     for ptr in pointer.client_pointers(&client) {
+-                        if vertical != 0. {
+-                            ptr.axis(now_ms(), Axis::VerticalScroll, vertical);
++                        if ptr.version() >= 5 {
++                            ptr.axis_source(AxisSource::Wheel);
+                         }
+-                        if horizontal != 0. {
+-                            ptr.axis(now_ms(), Axis::HorizontalScroll, horizontal);
++                        for (axis, value) in [
++                            (Axis::VerticalScroll, vertical),
++                            (Axis::HorizontalScroll, horizontal),
++                        ] {
++                            if value == 0. {
++                                continue;
++                            }
++                            // Agent wheel amounts use 15 logical units per notch, like
++                            // libinput. Legacy X11 consumers also need the discrete value.
++                            if ptr.version() >= 8 {
++                                let value120 = (value * 120. / 15.).round() as i32;
++                                if value120 != 0 {
++                                    ptr.axis_value120(axis, value120);
++                                }
++                            } else if ptr.version() >= 5 {
++                                let discrete = (value / 15.).round() as i32;
++                                if discrete != 0 {
++                                    ptr.axis_discrete(axis, discrete);
++                                }
++                            }
++                            ptr.axis(now_ms(), axis, value);
+                         }
+                         if ptr.version() >= 5 {
+                             ptr.frame();
+@@ -1368,6 +1453,28 @@
+     use super::*;
+ 
+     #[test]
++    fn agent_motion_reenters_after_cursor_expiry_and_context_reuse() {
++        let mut state = AgentInputState::default();
++        let now = Instant::now();
++        let tint = state.context_tint(1, Some("agent-a")).unwrap();
++        state.move_cursor(1, (10., 20.).into(), now, Some("agent-a"), tint);
++        assert_eq!(state.motion_delta(1, (15., 25.).into(), false),
++                   (false, (5., 5.).into()));
++        // Refresh can expire an indicator while its protocol surface stays entered.
++        state.cursors.retain(|id, _| state.windows.contains_key(id));
++        assert_eq!(state.motion_delta(1, (100., 200.).into(), false),
++                   (true, (0., 0.).into()));
++        let tint = state.context_tint(1, Some("agent-b")).unwrap();
++        assert_eq!(state.motion_delta(1, (100., 200.).into(), false),
++                   (true, (0., 0.).into()));
++        state.move_cursor(1, (100., 200.).into(), now, Some("agent-b"), tint);
++        assert_eq!(state.motion_delta(1, (103., 204.).into(), false),
++                   (false, (3., 4.).into()));
++        assert_eq!(state.motion_delta(1, (103., 204.).into(), true),
++                   (true, (0., 0.).into()));
++    }
++
++    #[test]
+     fn context_tint_survives_windows_leave_expiry_and_fifo_eviction() {
+         let mut state = AgentInputState::default();
+         let now = Instant::now();

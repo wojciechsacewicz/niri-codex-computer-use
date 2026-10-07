@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check vendor niri background control inside a private Xvfb display."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -10,19 +11,36 @@ import sys
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--niri', type=Path, required=True)
 parser.add_argument('--xvfb', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
+parser.add_argument('--stress-cycles', type=int, default=0)
+parser.add_argument('--stress-scale', type=float, default=1.0)
+parser.add_argument('--parent-wayland-socket', type=Path)
+parser.add_argument('--parent-niri-socket', type=Path)
 args = parser.parse_args()
+if not 0 <= args.stress_cycles <= 1000 or not 1 <= args.stress_scale <= 2:
+    parser.error('stress cycles must be 0..1000 and scale 1..2')
+if bool(args.parent_wayland_socket) != bool(args.parent_niri_socket):
+    parser.error('GPU nesting requires both parent Wayland and niri socket paths')
+for parent in [args.parent_wayland_socket, args.parent_niri_socket]:
+    if parent and (not parent.is_absolute() or not parent.is_socket()):
+        parser.error('parent sockets must be existing absolute socket paths')
 args.output.mkdir(parents=True, exist_ok=True)
 args.output = args.output.resolve()
 (args.output / 'result.json').unlink(missing_ok=True)
 root = Path(__file__).resolve().parent
+initial_test_hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ['nested-control.py', 'gtk-fixture.py']}
+initial_binary_hash = hashlib.sha256(args.niri.read_bytes()).hexdigest()
 processes = []
 logs = []
+parent_pump_stop = threading.Event()
+parent_pump = None
+parent_pump_errors = []
 
 
 def spawn(command, env, name):
@@ -54,16 +72,28 @@ def read_state(name):
 runtime = tempfile.TemporaryDirectory(prefix='niri-cua-test-')
 try:
     env = os.environ.copy()
-    for key in ['WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'NIRI_SOCKET', 'DBUS_SESSION_BUS_ADDRESS', 'MANAGERPID', 'SYSTEMD_EXEC_PID']:
+    for key in ['WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'NIRI_SOCKET', 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_SESSION_BUS_PID', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE', 'AT_SPI_BUS_ADDRESS', 'NIRI_CONFIG', 'NIRI_AGENT_LAUNCH', 'MANAGERPID', 'SYSTEMD_EXEC_PID']:
         env.pop(key, None)
     env.update(XDG_RUNTIME_DIR=runtime.name, WINIT_UNIX_BACKEND='x11',
-               GIO_USE_VFS='local', LIBGL_ALWAYS_SOFTWARE='1', LP_NUM_THREADS='2', GALLIUM_DRIVER='llvmpipe')
+               NO_AT_BRIDGE='1', GIO_USE_VFS='local', LIBGL_ALWAYS_SOFTWARE='1', LP_NUM_THREADS='2', GALLIUM_DRIVER='llvmpipe')
     display = next(n for n in range(91, 110) if not Path(f'/tmp/.X11-unix/X{n}').exists())
     env['DISPLAY'] = f':{display}'
     auth = Path(runtime.name) / 'Xauthority'
     env['XAUTHORITY'] = str(auth)
     bus_log = (args.output / 'dbus.log').open('w'); logs.append(bus_log)
-    bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
+    bus_config = Path(runtime.name) / 'dbus.conf'
+    bus_config.write_text(f'''<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir={runtime.name}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow own="*"/>
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+''')
+    bus = subprocess.Popen(['dbus-daemon', '--config-file=' + str(bus_config), '--nofork', '--print-address=1'],
                            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=bus_log, text=True, start_new_session=True)
     processes.append(bus)
@@ -97,20 +127,36 @@ input {
     }
 }
 ''')
+    if args.stress_cycles:
+        config.write_text(config.read_text().replace('layout {\n', 'layout {\n    shadow {\n        on\n        softness 30\n        spread 5\n        offset x=0 y=5\n    }\n')
+                          + '\noutput "winit" { scale ' + str(args.stress_scale) + '; }\n'
+                          + 'window-rule { geometry-corner-radius 12; }\n')
     theme = os.environ.get('NCCU_TEST_CURSOR_THEME')
     if theme:
         config.write_text(config.read_text() + '\ncursor { xcursor-theme ' + json.dumps(theme) + '; xcursor-size 24; }\n')
     subprocess.run([str(args.niri.resolve()), 'validate', '-c', str(config)], env=env,
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
-    niri = spawn([str(args.niri.resolve()), '-c', str(config)], env, 'niri')
+    renderer_env = env.copy()
+    if args.parent_wayland_socket:
+        for key in ['LIBGL_ALWAYS_SOFTWARE', 'GALLIUM_DRIVER', 'DISPLAY']:
+            renderer_env.pop(key, None)
+        renderer_env.update(WAYLAND_DISPLAY=str(args.parent_wayland_socket),
+                            WINIT_UNIX_BACKEND='wayland', NIRI_AGENT_LAUNCH='1',
+                            RUST_LOG='niri=info,smithay::backend::egl=info,smithay::backend::renderer::gles=debug')
+    if args.parent_niri_socket:
+        parent_env = {**env, 'NIRI_SOCKET': str(args.parent_niri_socket)}
+        initial_parent = json.loads(subprocess.check_output([str(args.niri.resolve()), 'msg', '-j', 'focused-window'], env=parent_env, timeout=5))
+        if initial_parent is None:
+            raise RuntimeError('GPU background verification needs an already focused foreground app; no test window was opened')
+    niri = spawn([str(args.niri.resolve()), '-c', str(config)], renderer_env, 'niri')
     ipc_path = wait_for(lambda: next(Path(runtime.name).glob('niri.*.sock'), None), 'nested niri IPC', 20)
     wayland = wait_for(lambda: next((p for p in Path(runtime.name).glob('wayland-*') if not p.name.endswith('.lock')), None), 'nested Wayland')
     env.update(NIRI_SOCKET=str(ipc_path), WAYLAND_DISPLAY=wayland.name, GDK_BACKEND='wayland')
 
-    def ipc(request):
+    def ipc(request, socket_path=None):
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(5)
-            client.connect(str(ipc_path))
+            client.connect(str(socket_path or ipc_path))
             client.sendall(json.dumps(request).encode() + b'\n')
             client.shutdown(socket.SHUT_WR)
             response = b''
@@ -119,6 +165,8 @@ input {
                 if not chunk:
                     break
                 response += chunk
+            if not response:
+                raise RuntimeError(f'IPC closed without a response; compositor exit status={niri.poll()}')
             result = json.loads(response)
         if 'Err' in result:
             raise RuntimeError(str(result['Err']))
@@ -132,6 +180,23 @@ input {
 
     def focused():
         return ipc('FocusedWindow')['FocusedWindow']['id']
+
+    if args.parent_niri_socket:
+        def owned_parent_window():
+            return next((window for window in ipc('Windows', args.parent_niri_socket)['Windows'] if window.get('pid') == niri.pid), None)
+        parent_window = wait_for(owned_parent_window, 'owned nested GPU window')
+        assert ipc('FocusedWindow', args.parent_niri_socket)['FocusedWindow']['id'] != parent_window['id'], 'Nested GPU launch took human focus'
+        # Hidden Wayland clients wait for frame callbacks; pump only our test window.
+        def pump_parent():
+            while not parent_pump_stop.is_set():
+                try:
+                    ipc({'AgentScreenshot': {'window_id': parent_window['id'], 'path': str(args.output / 'nested-parent.png'), 'show_pointer': False}}, args.parent_niri_socket)
+                except Exception as error:
+                    parent_pump_errors.append(str(error))
+                    return
+                parent_pump_stop.wait(0.25)
+        parent_pump = threading.Thread(target=pump_parent, daemon=True)
+        parent_pump.start()
 
     spawn([sys.executable, str(root / 'gtk-fixture.py'), 'Human verification', str(args.output / 'human.json')], env, 'human')
     human = wait_for(lambda: find_window('Human verification'), 'human window')
@@ -181,7 +246,10 @@ input {
     wait_for(lambda: len(read_state('agent')['selection']) == 2, 'background text-selection drag')
     time.sleep(0.3)  # Let the vendor cursor animation complete for visual evidence.
     capture = 'from PIL import ImageGrab;import os,sys;ImageGrab.grab(xdisplay=os.environ["DISPLAY"]).save(sys.argv[1])'
-    subprocess.run([sys.executable, '-c', capture, str(args.output / 'agent-cursor-screen.png')], env=env, check=True, timeout=5)
+    if args.parent_niri_socket:
+        ipc({'AgentScreenshot': {'window_id': parent_window['id'], 'path': str(args.output / 'agent-cursor-screen.png'), 'show_pointer': False}}, args.parent_niri_socket)
+    else:
+        subprocess.run([sys.executable, '-c', capture, str(args.output / 'agent-cursor-screen.png')], env=env, check=True, timeout=5)
     # Driving the human client must fail without entering it or sending input.
     try:
         ipc({'AgentInput': {'window_id': human['id'], 'events': [{'Text': {'text':'must-not-arrive', 'unicode_input':'Keymap'}}]}})
@@ -203,11 +271,54 @@ input {
     assert subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True) == pointer_before
     assert subprocess.check_output(['wl-paste', '--no-newline'], env=env) == clipboard_before
     assert focused() == human['id']
-    result = dict(binary_sha256={'niri': hashlib.sha256(args.niri.read_bytes()).hexdigest()}, test_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ['nested-control.py', 'gtk-fixture.py']}, status='passed', background_text=True, background_click=True, background_scroll=True,
+    if args.stress_cycles:
+        from PIL import Image
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=3) as captures:
+            for cycle in range(args.stress_cycles):
+                ipc({'Action': {'MoveWindowToWorkspace': {'window_id': agent['id'], 'reference': {'Index': 1 + cycle % 2}, 'focus': False}}})
+                ipc({'Action': {'SetWindowWidth': {'id': agent['id'], 'change': {'SetFixed': 430 + (cycle % 5) * 65}}}})
+                send([{'Motion': {'x': 45.0, 'y': 60.0}}, {'Axis': {'vertical': 24.0, 'horizontal': 0.0}}])
+                image_path = args.output / 'lifecycle-window.png'
+                ipc({'AgentScreenshot': {'window_id': agent['id'], 'path': str(image_path), 'show_pointer': True}})
+                with Image.open(image_path) as image:
+                    assert image.width > 0 and image.height > 0
+                    image.verify()
+                if cycle % 8 == 7:
+                    old_id = agent['id']
+                    pending = [captures.submit(ipc, {'AgentScreenshot': {'window_id': old_id, 'path': str(args.output / f'closing-{index}.png'), 'show_pointer': True}}) for index in range(3)]
+                    ipc({'Action': {'CloseWindow': {'id': old_id}}})
+                    wait_for(lambda: find_window('Agent verification') is None, 'closed agent window')
+                    for future in pending:
+                        try:
+                            future.result(timeout=5)
+                        except RuntimeError as error:
+                            assert 'no window with id' in str(error), str(error)
+                    (args.output / 'agent.json').unlink(missing_ok=True)
+                    spawn([sys.executable, str(root / 'gtk-fixture.py'), 'Agent verification', str(args.output / 'agent.json')], agent_env, f'lifecycle-{cycle}')
+                    agent = wait_for(lambda: find_window('Agent verification'), 'reopened agent window')
+                    state = wait_for(lambda: read_state('agent') if read_state('agent').get('widgets') else None, 'reopened widgets')
+                assert niri.poll() is None, 'Compositor exited during window lifecycle stress'
+                assert focused() == human['id'], 'Lifecycle stress changed human focus'
+                assert read_state('human')['text'] == 'human-before human-after', 'Lifecycle input reached the human'
+        assert subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True) == pointer_before
+        assert subprocess.check_output(['wl-paste', '--no-newline'], env=env) == clipboard_before
+        print(json.dumps({'lifecycle_cycles': args.stress_cycles, 'scale': args.stress_scale, 'seconds': round(time.monotonic() - started, 2)}), flush=True)
+    assert not parent_pump_errors, f'Parent frame pump failed: {parent_pump_errors}'
+    assert hashlib.sha256(args.niri.read_bytes()).hexdigest() == initial_binary_hash, 'Compositor binary changed during the check'
+    assert {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in initial_test_hashes} == initial_test_hashes, 'Test sources changed during the check'
+    result = dict(binary_sha256={'niri': initial_binary_hash}, test_sha256=initial_test_hashes, status='passed', background_text=True, background_click=True, background_scroll=True,
                   background_unicode=True, background_drag=True, offscreen_input=True, focused_client_refused=True,
                   human_focus_unchanged=True, human_pointer_unchanged=True, clipboard_unchanged=True,
-                  input_streams_isolated=True, screenshot=screenshot, windows=windows())
+                  input_streams_isolated=True, lifecycle_cycles=args.stress_cycles, lifecycle_scale=args.stress_scale,
+                  renderer_backend='parent-wayland' if args.parent_wayland_socket else 'private-x11-software',
+                  screenshot=screenshot, windows=windows())
 finally:
+    if sys.exc_info()[0] is not None:
+        (args.output / 'failure-processes.json').write_text(json.dumps([{'pid': child.pid, 'exit_status': child.poll()} for child in processes], indent=2) + '\n')
+    parent_pump_stop.set()
+    if parent_pump:
+        parent_pump.join(timeout=6)
     if 'ipc' in locals():
         try:
             ipc({'Action': {'Quit': {'skip_confirmation': True}}})

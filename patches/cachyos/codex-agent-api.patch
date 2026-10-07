@@ -194,7 +194,7 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
          key: &'static str,
 --- a/linux-features/computer-use-linux/native-client.mjs
 +++ b/linux-features/computer-use-linux/native-client.mjs
-@@ -53,11 +53,10 @@
+@@ -53,15 +53,22 @@
    const browserState = cua.getState?.bind(cua);
    cua.listApps = async (options = {}) => {
      const apps = await call('list_apps');
@@ -207,8 +207,22 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
 +  cua.computer = { ...cua.computer, target: 'linux',
      launch_app: async ({ app }) => { await call('launch_app', app); } };
    const linuxState = async (options = {}) => {
-     const state = browserState ? await browserState({ emit: false }) : { browsers: [] };
-@@ -73,28 +72,15 @@
+-    const state = browserState ? await browserState({ emit: false }) : { browsers: [] };
+-    return emit({ ...state, apps: await cua.listApps({ emit: false }) }, options);
++    const [native, browser] = await Promise.allSettled([
++      cua.listApps({ emit: false }),
++      Promise.resolve().then(() => browserState ? browserState({ emit: false }) : { browsers: [] }),
++    ]);
++    const state = browser.status === 'fulfilled' ? browser.value : { browsers: [] };
++    const errors = [...(state.errors ?? [])];
++    if (native.status === 'rejected') errors.push(`Native apps: ${String(native.reason)}`);
++    if (browser.status === 'rejected') errors.push(`Browsers: ${String(browser.reason)}`);
++    return emit({ ...state, apps: native.status === 'fulfilled' ? native.value : [],
++      ...(errors.length ? { errors } : {}) }, options);
+   };
+   cua.getState = linuxState;
+   cua.initialize = linuxState;
+@@ -73,28 +80,15 @@
      if (typeof app !== 'string' || !app.trim()) throw new Error('getApp requires a non-empty app id');
      const unsupported = async () => { throw new Error('This native Linux Computer Use operation is not supported'); };
      const state = options => call('get_app_state', app, { include_screenshot: false, ...axBackendOptions(options) });
@@ -239,7 +253,7 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
        return JSON.stringify({
          accessibility_tree: options?.compact === false ? result.accessibility_tree : compactTree,
          window_context: result.window_context,
-@@ -119,6 +105,54 @@
+@@ -119,6 +113,54 @@
        if (!Array.isArray(target) || target.length !== 2 || !target.every(Number.isInteger)) throw new Error('Linux native input requires integer window-relative coordinates');
        return { x: target[0], y: target[1] };
      };
@@ -294,7 +308,7 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
      const target = {
        getAXState: async (options = {}) => emit(axText(await state(options), options), options),
        getScreenshot: async (options = {}) => screenshot(await call('screenshot', app, screenshotBackendOptions(options)), options),
-@@ -130,13 +164,19 @@
+@@ -130,38 +172,47 @@
          const result = { ...await state(options), ...capture };
          return { state: emit(axText(result, options), options), ...(result.screenshot ? { screenshot: await screenshot(result, options) } : {}) };
        },
@@ -302,33 +316,80 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
 -      pressKey: key => call('press_key', app, { key }),
 -      typeText: text => call('type_text', app, { text }),
 -      scroll: (location, direction, distance = 1) => {
+-        const pages = typeof distance === 'object' && distance !== null ? distance.pixels / 600 : distance;
+-        if (typeof pages !== 'number' || !Number.isFinite(pages) || pages <= 0) throw new Error('Linux scroll requires a positive distance or { pixels }');
+-        return call('scroll', app, { ...point(location), direction, pages, relative: true });
 +      click: async (location, options = {}) => {
 +        const mouse = button(options.mouseButton ?? 'left');
 +        const count = options.clickCount ?? 1;
 +        if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('Invalid click count');
++        if (typeof location === 'number' && (mouse === 'middle' || count !== 1)) {
++          throw new Error('Linux element clicks support one left or right click; use coordinates for other click options');
++        }
 +        await call('click', app, { ...await inputPoint(location), button: mouse, click_count: count, relative: true });
 +      },
 +      pressKey: async key => { await call('press_key', app, { key }); },
 +      typeText: async text => { await call('type_text', app, { text }); },
-+      scroll: async (location, scrollDirection, distance = 1) => {
++      scroll: async (location, scrollDirection, distance) => {
++        if (typeof distance === 'number') throw new Error('Linux scroll accepts { pixels }, not pages.');
 +        const normalized = direction(scrollDirection);
-         const pages = typeof distance === 'object' && distance !== null ? distance.pixels / 600 : distance;
-         if (typeof pages !== 'number' || !Number.isFinite(pages) || pages <= 0) throw new Error('Linux scroll requires a positive distance or { pixels }');
--        return call('scroll', app, { ...point(location), direction, pages, relative: true });
-+        await call('scroll', app, { ...await inputPoint(location), direction: normalized, pages, relative: true });
++        let pages;
++        if (distance !== undefined) {
++          const pixels = distance?.pixels;
++          if (!Number.isFinite(pixels) || pixels <= 0) throw new Error('pixels must be a positive finite number.');
++          // The backend quantizes pixel distances to wheel steps.
++          pages = pixels / 600;
++        }
++        await call('scroll', app, { ...await inputPoint(location), direction: normalized,
++          ...(pages === undefined ? {} : { pages }), relative: true });
        },
        paste: async (text, options = {}) => {
-         if (options.format && options.format !== 'text') return unsupported();
-@@ -154,7 +194,6 @@
-       toggleMaximize: () => call('toggle_maximize', app),
+-        if (options.format && options.format !== 'text') return unsupported();
+-        return call('type_text', app, { text });
+-      },
+-      drag: (from, to) => {
++        if (options.format !== undefined && options.format !== 'text') throw new Error('Linux paste supports only text format.');
++        await call('type_text', app, { text });
++      },
++      drag: async (from, to) => {
+         const start = point(from);
+         const end = point(to);
+-        return call('drag', app, {
++        await call('drag', app, {
+           start_x: start.x, start_y: start.y,
+           end_x: end.x, end_y: end.y,
+           relative: true,
+         });
+       },
+-      toggleMaximize: () => call('toggle_maximize', app),
++      toggleMaximize: async () => { await call('toggle_maximize', app); },
        selectText: unsupported, setValue: unsupported, performSecondaryAction: unsupported,
      };
 -    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), drag([startX,startY], [endX,endY]), toggleMaximize(), pressKey(key), typeText(text), scroll([x,y], direction, {pixels} or legacy pages?), paste(text). Pixel distances are quantized to wheel steps by the backend. AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs emit images themselves. In niri background mode, capture and input keep the user\'s pointer, focus and workspace unchanged; getAXState() remains passive. Click/drag/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
-     try { await target.getAXState(); }
-     catch (error) {
-       if (app.startsWith('linux-window:') || !/No window matched/i.test(error.message)) throw error;
+-    try { await target.getAXState(); }
+-    catch (error) {
+-      if (app.startsWith('linux-window:') || !/No window matched/i.test(error.message)) throw error;
+-      const launched = await call('launch_app', app);
+-      app = launched.id;
+-      await target.getAXState();
+-    }
++    await target.getAXState();
+     return target;
+   };
+   return cua;
 --- a/linux-features/computer-use-linux/native.test.js
 +++ b/linux-features/computer-use-linux/native.test.js
+@@ -30,8 +30,8 @@
+     await app.drag([1, 2], [3, 4]);
+     assert.deepEqual(calls.at(-1), ['sky', { method: 'drag', app: 'linux-window:22', params: { start_x: 1, start_y: 2, end_x: 3, end_y: 4, relative: true } }]);
+     const before = calls.length;
+-    assert.throws(() => app.drag({ x: 1, y: 2 }, { x: 3, y: 4 }), /integer window-relative/);
+-    await assert.rejects(app.paste('x', { format: 'html' }), /not supported/);
++    await assert.rejects(app.drag({ x: 1, y: 2 }, { x: 3, y: 4 }), /integer window-relative/);
++    await assert.rejects(app.paste('x', { format: 'html' }), /only text format/);
+     assert.equal(calls.length, before);
+   } finally { globalThis.nodeRepl = original; }
+ });
 @@ -151,7 +151,7 @@
  });
  `);
@@ -366,7 +427,28 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
    } finally { globalThis.nodeRepl=original; }
  });
  
-@@ -530,3 +531,50 @@
+@@ -509,7 +510,7 @@
+   } finally { service.shutdown(); }
+ });
+ 
+-test('vendor launch binds the new window without changing SDK window inventory', async () => {
++test('getApp never launches implicitly and explicit launch keeps Linux target and inventory methods', async () => {
+   const { installLinuxComputerUse } = await import('./native-client.mjs');
+   const original = globalThis.nodeRepl;
+   const calls = [];
+@@ -523,10 +524,195 @@
+   try {
+     const cua = installLinuxComputerUse({ computer: { existing: true } });
+     assert.equal(cua.computer.existing, true);
+-    const app = await cua.getApp('editor');
++    assert.equal(cua.computer.target, 'linux');
++    await assert.rejects(cua.getApp('editor'), /No window matched editor/);
++    assert.deepEqual(calls.map(call => call.method), ['get_app_state']);
++    assert.equal(await cua.computer.launch_app({ app: 'editor' }), undefined);
++    const app = await cua.getApp({ windowId: 22 });
+     await app.typeText('hello');
+     assert.deepEqual(calls.map(call => [call.method, call.app]), [
+       ['get_app_state', 'editor'], ['launch_app', 'editor'], ['get_app_state', 'linux-window:22'], ['type_text', 'linux-window:22'],
      ]);
    } finally { globalThis.nodeRepl = original; }
  });
@@ -389,8 +471,14 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
 +    }};
 +    try {
 +      const app = await installLinuxComputerUse({}).getApp({windowId:22});
-+      await app.click(4,{mouseButton:'l',clickCount:2});
-+      assert.deepEqual(calls.at(-1).params,{x:114,y:102,button:'left',click_count:2,relative:true});
++      const initialCalls = calls.length;
++      await assert.rejects(app.click(4,{mouseButton:'l',clickCount:2}), /one left or right click/);
++      await assert.rejects(app.click(4,{mouseButton:'m'}), /one left or right click/);
++      assert.equal(calls.length, initialCalls);
++      await app.click(4,{mouseButton:'l'});
++      assert.deepEqual(calls.at(-1).params,{x:114,y:102,button:'left',click_count:1,relative:true});
++      await app.click(4,{mouseButton:'r'});
++      assert.deepEqual(calls.at(-1).params,{x:114,y:102,button:'right',click_count:1,relative:true});
 +      await app.scroll(4,'d',{pixels:600});
 +      assert.deepEqual(calls.at(-1).params,{x:114,y:102,direction:'down',pages:1,relative:true});
 +      stale = true;
@@ -416,6 +504,134 @@ Subject: Keep native app actions and discovery compatible with the installed CUA
 +  assert.deepEqual(nativeWindows(apps).map(window=>window.id),[22,23]);
 +  assert.deepEqual(nativeSkyApps(apps).map(app=>app.name),['Editor','Closed','custom']);
 +  assert.equal(nativeWindows([...apps,apps[0]]).length,2);
++});
++
++test('inventory failures preserve the other inventory and emit errors once', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const apps = [{id:'linux-window:22',displayName:'Editor',windows:[{id:22,app:'Editor'}]}];
++  const browsers = [{id:'iab',tabs:[]}];
++  try {
++    for (const api of ['getState','initialize']) {
++      for (const failed of ['native','browser','both']) {
++        const writes = [];
++        globalThis.nodeRepl = {write:value=>writes.push(value),rpc:async (_, request) => {
++          assert.equal(request.method,'list_apps');
++          if (failed !== 'browser') throw new Error('native unavailable');
++          return apps;
++        }};
++        const cua = installLinuxComputerUse({getState:async options => {
++          assert.equal(options.emit,false);
++          if (failed !== 'native') throw new Error('browser unavailable');
++          return {apps:[],browsers,errors:['Existing browser inventory warning']};
++        }});
++        const state = await cua[api]({emit:false});
++        assert.deepEqual(state.apps,failed === 'browser' ? apps : []);
++        assert.deepEqual(state.browsers,failed === 'native' ? browsers : []);
++        assert.deepEqual(state.errors,failed === 'native'
++          ? ['Existing browser inventory warning','Native apps: Error: native unavailable']
++          : failed === 'browser' ? ['Browsers: Error: browser unavailable']
++          : ['Native apps: Error: native unavailable','Browsers: Error: browser unavailable']);
++        assert.deepEqual(writes,[]);
++        assert.deepEqual(await cua[api](),state);
++        assert.deepEqual(writes,[state]);
++      }
++    }
++  } finally {globalThis.nodeRepl=original;}
++});
++
++test('Linux mutation methods resolve void and preserve backend rejections', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const calls = [];
++  const failure = new Error('backend refused input');
++  let reject = false;
++  globalThis.nodeRepl = {write(){},rpc:async (_, request) => {
++    calls.push(request);
++    if (reject) throw failure;
++    return request.method === 'get_app_state' ? {accessibility_tree:[]} : {ok:true};
++  }};
++  try {
++    const cua = installLinuxComputerUse({});
++    const app = await cua.getApp({windowId:22});
++    const actions = [
++      ['click',()=>app.click([1,2])],
++      ['drag',()=>app.drag([1,2],[3,4])],
++      ['scroll',()=>app.scroll([1,2],'down')],
++      ['press_key',()=>app.pressKey('Return')],
++      ['type_text',()=>app.typeText('hello')],
++      ['type_text',()=>app.paste('hello',{format:'text'})],
++      ['toggle_maximize',()=>app.toggleMaximize()],
++      ['launch_app',()=>cua.computer.launch_app({app:'editor.desktop'})],
++    ];
++    for (const [method,action] of actions) {
++      assert.equal(await action(),undefined);
++      assert.equal(calls.at(-1).method,method);
++    }
++    reject = true;
++    for (const [,action] of actions) await assert.rejects(action(),error=>error === failure);
++  } finally {globalThis.nodeRepl=original;}
++});
++
++test('Linux scroll accepts pixel objects and native defaults, rejecting pages before RPC', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const calls = [];
++  globalThis.nodeRepl = {write(){},rpc:async (_, request)=>{calls.push(request);return {accessibility_tree:[]};}};
++  try {
++    const app = await installLinuxComputerUse({}).getApp({windowId:22});
++    for (const [alias,direction] of Object.entries({up:'up',u:'up',down:'down',d:'down',left:'left',l:'left',right:'right',r:'right'})) {
++      assert.equal(await app.scroll([10,20],alias),undefined);
++      assert.deepEqual(calls.at(-1).params,{x:10,y:20,direction,relative:true});
++    }
++    await app.scroll([10,20],'down',undefined);
++    assert.deepEqual(calls.at(-1).params,{x:10,y:20,direction:'down',relative:true});
++    for (const pixels of [500,0.5]) {
++      await app.scroll([10,20],'d',{pixels});
++      assert.deepEqual(calls.at(-1).params,{x:10,y:20,direction:'down',pages:pixels/600,relative:true});
++    }
++    const before = calls.length;
++    for (const pages of [1,0,-1,NaN,Infinity]) {
++      await assert.rejects(app.scroll([10,20],'down',pages),/accepts \{ pixels \}, not pages/);
++    }
++    for (const distance of [null,{},'600',{pixels:'600'},{pixels:0},{pixels:-1},{pixels:NaN},{pixels:Infinity}]) {
++      await assert.rejects(app.scroll([10,20],'down',distance),/positive finite number/);
++    }
++    assert.equal(calls.length,before);
++  } finally {globalThis.nodeRepl=original;}
++});
++
++test('coordinate clicks retain all documented button aliases and multiple clicks', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const calls = [];
++  globalThis.nodeRepl = {write(){},rpc:async (_,request)=>{calls.push(request);return {accessibility_tree:[]};}};
++  try {
++    const app = await installLinuxComputerUse({}).getApp({windowId:22});
++    for (const [mouseButton,button] of Object.entries({left:'left',l:'left',right:'right',r:'right',middle:'middle',m:'middle'})) {
++      assert.equal(await app.click([10,20],{mouseButton,clickCount:2}),undefined);
++      assert.deepEqual(calls.at(-1).params,{x:10,y:20,button,click_count:2,relative:true});
++    }
++  } finally {globalThis.nodeRepl=original;}
++});
++
++test('Linux unsupported text selection, values and paste formats reject before RPC', async () => {
++  const { installLinuxComputerUse } = await import('./native-client.mjs');
++  const original = globalThis.nodeRepl;
++  const calls = [];
++  globalThis.nodeRepl = {write(){},rpc:async (_,request)=>{calls.push(request);return {accessibility_tree:[]};}};
++  try {
++    const app = await installLinuxComputerUse({}).getApp({windowId:22});
++    const before = calls.length;
++    await assert.rejects(app.selectText(1,'hello'),/not supported/);
++    await assert.rejects(app.setValue(1,'hello'),/not supported/);
++    for (const format of ['md','html','',null,false,0]) {
++      await assert.rejects(app.paste('hello',{format}),/only text format/);
++    }
++    assert.equal(calls.length,before);
++    assert.equal(await app.paste('plain'),undefined);
++    assert.equal(await app.paste('plain',{format:undefined}),undefined);
++  } finally {globalThis.nodeRepl=original;}
 +});
 --- a/linux-features/computer-use-linux/native-protocol.mjs
 +++ b/linux-features/computer-use-linux/native-protocol.mjs

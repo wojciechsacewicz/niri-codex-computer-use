@@ -1,6 +1,6 @@
 pkgname=niri-codex-computer-use
 pkgver=0.1.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Background Codex computer use on niri with a visible agent cursor'
 arch=('x86_64')
 url='https://github.com/wojciechsacewicz/niri-codex-computer-use'

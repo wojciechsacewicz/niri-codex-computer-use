@@ -51,6 +51,6 @@ def prepare(name, source, patches):
 
 
 if args.component in ['niri', 'all']:
-    prepare('niri', lock['niri'], [root / 'patches/niri-ipc-tiled-window-position.patch', root / 'patches/niri-agent-input.patch', root / 'patches/cachyos/niri-themed-agent-cursor.patch'])
+    prepare('niri', lock['niri'], [root / 'patches/niri-ipc-tiled-window-position.patch', root / 'patches/niri-agent-input.patch', root / 'patches/cachyos/niri-themed-agent-cursor.patch', root / 'patches/cachyos/niri-x11-input.patch'])
 if args.component in ['codex', 'all']:
     prepare('codex-desktop-linux', lock['codex_desktop_linux'], [root / 'patches/cachyos/codex-helium-support.patch', root / 'patches/cachyos/codex-current-sdk.patch', root / 'patches/cachyos/codex-niri-background.patch', root / 'patches/cachyos/codex-plugin-cache.patch', root / 'patches/cachyos/codex-agent-api.patch'])

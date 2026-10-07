@@ -32,3 +32,10 @@ Cleanup asks only the owned niri instance to quit, accepts EOF during shutdown,
 and then reaps all owned process groups, including the private bus and Xvfb.
 A successful result records `owned_processes_reaped: true`. The main desktop and
 its environment are never used as control targets.
+
+`make test-x11` runs the same backend checks on a normally opened GTK X11 window
+in the private compositor's default XWayland satellite, with accessibility
+disabled for that app. It does not create an agent-only X server or relaunch the
+app during control. A second X11 window verifies that shared-client input is
+refused while the human uses it. Capability failures are recorded as failures,
+including incorrect Unicode text or a scroll request that has no effect.
