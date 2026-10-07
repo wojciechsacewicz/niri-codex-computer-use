@@ -25,3 +25,5 @@ When updating a dependency, check that its patches still apply and run the relev
 ## Project hygiene
 
 Use Conventional Commits when making commits. Keep build output, local machine paths, credentials, and session notes out of the repository. Documentation should be in plain English.
+
+Enable the local privacy check with `git config --local core.hooksPath .githooks`. It checks staged files without printing suspected private values. Run `python3 scripts/check-public-files.py` to check tracked files. Review screenshots before adding them; the check detects PNG metadata, not private information in the pixels.
