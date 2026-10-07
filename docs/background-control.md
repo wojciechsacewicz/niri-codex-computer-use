@@ -6,7 +6,7 @@ The implementation comes from [lihaoze123/niri-computer-use](https://github.com/
 
 ## Limits inherited from upstream
 
-The agent cannot operate an app client that currently holds the person's keyboard focus. This includes two windows created by the same browser process. Use a separate browser profile and process for agent work.
+The agent cannot operate an app client that currently holds the person's keyboard focus. This includes two windows created by the same browser process. Use a separate browser profile and process for agent work. XWayland apps share the satellite's Wayland client, so the same conflict also applies across separate X11 or Wine apps. A real X11 fixture confirmed that input is refused while a Wine app holds human focus.
 
 The upstream pointer hold can suppress real pointer delivery to the agent client for 600 ms after input, or during an agent drag. If you move your mouse into that same client, its hover cursor can briefly change. Work in a separate app while the agent runs. Full same-client pointer independence is still an open limitation.
 

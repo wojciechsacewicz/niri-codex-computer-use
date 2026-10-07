@@ -1,0 +1,1099 @@
+Subject: [PATCH] Render agent cursors from the current human cursor image with a lifetime tint
+
+Apply after niri-ipc-tiled-window-position.patch and niri-agent-input.patch.
+Reuse CursorManager theme selection, animation frames and CursorTextureCache.
+Tint only the independent agent render elements, including client cursor surfaces.
+Optional agent_id keeps the context tint stable across windows and indicator expiry.
+A FIFO cache holds at most 128 contexts and preserves active contexts. Random
+hash keys keep colors stable after eviction. Legacy requests share a default context.
+
+diff --git a/src/agent_input.rs b/src/agent_input.rs
+--- a/src/agent_input.rs
++++ b/src/agent_input.rs
+@@ -13,24 +13,37 @@
+ 
+ use niri_ipc::{AgentActivityKind, AgentEvent, AgentScreenshotInfo, AgentUnicodeInput};
+ use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, WindowSurfaceType};
+-use smithay::input::keyboard::{xkb, KeymapFile, Keycode};
++use smithay::input::keyboard::{xkb, Keycode, KeymapFile};
++use smithay::reexports::wayland_server::backend::ClientId;
+ use smithay::reexports::wayland_server::protocol::wl_keyboard::{KeyState, KeymapFormat};
+ use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis, ButtonState};
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+-use smithay::reexports::wayland_server::backend::ClientId;
+ use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
++use std::cell::RefCell;
++use std::collections::hash_map::RandomState;
+ use std::collections::{HashMap, VecDeque};
++use std::hash::BuildHasher;
++use std::rc::Rc;
+ use std::time::{Duration, Instant};
+ 
++use niri_config::{Color, CornerRadius, GradientInterpolation};
+ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+-use niri_config::{Color, CornerRadius, GradientInterpolation};
+ use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER};
+-use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceAttributes, TraversalAction};
+-
+-use crate::niri::{Niri, State};
++use smithay::wayland::compositor::{
++    with_surface_tree_downward, SurfaceAttributes, TraversalAction,
++};
++
++use crate::cursor::AgentCursorImage;
++use crate::niri::{Niri, PointerRenderElements, State};
+ use crate::render_helpers::border::BorderRenderElement;
++use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::surface::push_elements_from_surface_tree;
++use crate::render_helpers::tinted_cursor::TintedCursorRenderElement;
++use crate::utils::get_monotonic_time;
++use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
++use smithay::backend::renderer::element::{Element, Id, Kind};
++use smithay::utils::Scale;
+ use tracing::warn;
+-use crate::utils::get_monotonic_time;
+ 
+ #[derive(Debug, Default)]
+ pub struct AgentInputState {
+@@ -69,7 +82,17 @@
+     buttons: Vec<u32>,
+     /// Agent pointer indicators by window id, shown while the window is agent-driven.
+     cursors: HashMap<u64, AgentCursor>,
++    context_tints: AgentContextTints,
+     expiry_running: bool,
++}
++
++const MAX_AGENT_CONTEXTS: usize = 128;
++
++#[derive(Debug, Default)]
++struct AgentContextTints {
++    /// Random keys make colors random per compositor but stable after cache eviction.
++    hash_keys: RandomState,
++    entries: VecDeque<(Option<String>, [f32; 3])>,
+ }
+ 
+ #[derive(Debug)]
+@@ -105,15 +128,15 @@
+ const CURSOR_GLIDE: Duration = Duration::from_millis(180);
+ const CURSOR_RIPPLE: Duration = Duration::from_millis(520);
+ 
+-/// Agent pointer indicator colors: an indigo-to-violet gradient.
+-const CURSOR_FROM: [u8; 3] = [0x81, 0x8c, 0xf8];
+-const CURSOR_TO: [u8; 3] = [0xc0, 0x84, 0xfc];
+-
+-/// The agent's pointer as drawn on its window: a gradient dot with a white outline and a soft
+-/// halo. It glides to new positions, and a ring ripples out when a button is pressed.
+-#[derive(Debug, Clone, Copy, PartialEq)]
++/// The human cursor image tinted for the most recent agent context on this window.
++#[derive(Debug, Clone, PartialEq)]
+ pub struct AgentCursor {
+     shown_at: Instant,
++    tint: [f32; 3],
++    agent_id: Option<String>,
++    image: AgentCursorImage,
++    /// Do not reuse human cursor element IDs in the same damage tracker.
++    render_ids: Rc<RefCell<HashMap<Id, Id>>>,
+     /// Glide from `from` to `to` (relative to the window geometry), started at `moved_at`.
+     from: Point<f64, Logical>,
+     to: Point<f64, Logical>,
+@@ -130,14 +153,27 @@
+     (now.saturating_duration_since(since).as_secs_f64() / duration.as_secs_f64()).clamp(0., 1.)
+ }
+ 
+-fn cursor_color([r, g, b]: [u8; 3], alpha: f32) -> Color {
+-    Color::from_rgba8_unpremul(r, g, b, (alpha * 255.) as u8)
++fn cursor_tint_for_hue(hue: f32) -> [f32; 3] {
++    let x = 1. - (hue % 2. - 1.).abs();
++    let rgb = match hue as u8 {
++        0 => [1., x, 0.],
++        1 => [x, 1., 0.],
++        2 => [0., 1., x],
++        3 => [0., x, 1.],
++        4 => [x, 0., 1.],
++        _ => [1., 0., x],
++    };
++    rgb.map(|c| 0.2 + 0.75 * c)
+ }
+ 
+ impl AgentCursor {
+-    fn new(pos: Point<f64, Logical>, now: Instant) -> Self {
++    fn new(pos: Point<f64, Logical>, now: Instant, agent_id: Option<&str>, tint: [f32; 3]) -> Self {
+         Self {
+             shown_at: now,
++            tint,
++            agent_id: agent_id.map(str::to_owned),
++            image: AgentCursorImage::Hidden,
++            render_ids: Default::default(),
+             from: pos,
+             to: pos,
+             moved_at: now,
+@@ -146,6 +182,16 @@
+         }
+     }
+ 
++    fn set_context(&mut self, agent_id: Option<&str>, tint: [f32; 3]) {
++        if self.agent_id.as_deref() == agent_id {
++            return;
++        }
++        self.agent_id = agent_id.map(str::to_owned);
++        self.tint = tint;
++        // A color-only change needs new element IDs to invalidate the previous cursor damage.
++        self.render_ids = Default::default();
++    }
++
+     fn position(&self, now: Instant) -> Point<f64, Logical> {
+         let t = ease_out_cubic(progress(self.moved_at, now, CURSOR_GLIDE));
+         self.from + (self.to - self.from).upscale(t)
+@@ -165,76 +211,112 @@
+     }
+ 
+     pub fn is_animating(&self, now: Instant) -> bool {
+-        progress(self.shown_at, now, CURSOR_APPEAR) < 1.
++        self.image.is_animated()
++            || progress(self.shown_at, now, CURSOR_APPEAR) < 1.
+             || progress(self.moved_at, now, CURSOR_GLIDE) < 1.
+             || self
+                 .ripple
+                 .is_some_and(|(_, at)| progress(at, now, CURSOR_RIPPLE) < 1.)
+     }
+ 
+-    /// Renders the indicator for a window whose visual geometry is at `origin`.
+-    pub fn render(
++    fn render_id(&self, source: &Id) -> Id {
++        self.render_ids
++            .borrow_mut()
++            .entry(source.clone())
++            .or_insert_with(Id::new)
++            .clone()
++    }
++
++    /// Renders the cursor at its original hotspot, above the target window and popups.
++    pub fn render<R: NiriRenderer>(
++        &self,
++        renderer: &mut R,
++        origin: Point<f64, Logical>,
++        scale: Scale<f64>,
++        push: &mut dyn FnMut(TintedCursorRenderElement<R>),
++    ) {
++        let Some(program) = TintedCursorRenderElement::<R>::shader(renderer) else {
++            return;
++        };
++        let now = Instant::now();
++        let alpha = ease_out_cubic(progress(self.shown_at, now, CURSOR_APPEAR)) as f32;
++        let pos = origin + self.position(now);
++        let mut tinted = |elem: PointerRenderElements<R>| {
++            let id = self.render_id(elem.id());
++            push(TintedCursorRenderElement::new(
++                elem,
++                id,
++                program.clone(),
++                self.tint,
++            ));
++        };
++        match &self.image {
++            AgentCursorImage::Hidden => (),
++            AgentCursorImage::Surface { hotspot, surface } => {
++                let pos = (pos - hotspot.to_f64()).to_physical_precise_round(scale);
++                push_elements_from_surface_tree(
++                    renderer,
++                    surface,
++                    pos,
++                    scale,
++                    alpha,
++                    Kind::Cursor,
++                    &mut |elem| tinted(elem.into()),
++                );
++            }
++            AgentCursorImage::Named {
++                hotspot, buffer, ..
++            } => {
++                let pos = (pos - hotspot.to_f64()).to_physical_precise_round(scale);
++                match MemoryRenderBufferRenderElement::from_buffer(
++                    renderer,
++                    pos,
++                    buffer,
++                    Some(alpha),
++                    None,
++                    None,
++                    Kind::Cursor,
++                ) {
++                    Ok(elem) => tinted(elem.into()),
++                    Err(err) => warn!("error importing agent cursor texture: {err:?}"),
++                }
++            }
++        }
++    }
++
++    pub fn render_ripple(
+         &self,
+         origin: Point<f64, Logical>,
+         scale: f32,
+         push: &mut dyn FnMut(BorderRenderElement),
+     ) {
+-        let now = Instant::now();
+-        let appear = ease_out_cubic(progress(self.shown_at, now, CURSOR_APPEAR));
+-
+-        // A circle (or a ring when `width > 0`) centered at `center`.
+-        let circle = |center: Point<f64, Logical>,
+-                      diameter: f64,
+-                      from: Color,
+-                      to: Color,
+-                      width: f32,
+-                      alpha: f32| {
+-            let size = Size::from((diameter, diameter));
++        let Some((at, started)) = self.ripple else {
++            return;
++        };
++        let t = progress(started, Instant::now(), CURSOR_RIPPLE);
++        if t >= 1. {
++            return;
++        }
++        let e = ease_out_cubic(t);
++        let diameter = 14. + 42. * e;
++        let size = Size::from((diameter, diameter));
++        let tint = Color::new_unpremul(self.tint[0], self.tint[1], self.tint[2], 0.9);
++        push(
+             BorderRenderElement::new(
+                 size,
+                 Rectangle::from_size(size),
+                 GradientInterpolation::default(),
+-                from,
+-                to,
+-                45f32.to_radians(),
++                tint,
++                tint,
++                0.,
+                 Rectangle::from_size(size),
+-                width,
++                (2.5 - 1.5 * e) as f32,
+                 CornerRadius::from(diameter as f32 / 2.),
+                 scale,
+-                alpha,
++                (1. - e) as f32,
+             )
+-            .with_location(origin + center - Point::from((diameter / 2., diameter / 2.)))
+-        };
+-
+-        let center = self.position(now);
+-        let grow = 0.6 + 0.4 * appear;
+-        let alpha = appear as f32;
+-        let white = Color::from_rgba8_unpremul(255, 255, 255, 245);
+-        let shade = Color::from_rgba8_unpremul(0, 0, 0, 70);
+-
+-        // Topmost first: dot, white outline, dark hairline for light backgrounds.
+-        let from = cursor_color(CURSOR_FROM, 1.);
+-        let to = cursor_color(CURSOR_TO, 1.);
+-        push(circle(center, 10. * grow, from, to, 0., alpha));
+-        push(circle(center, 14. * grow, white, white, 0., alpha));
+-        push(circle(center, 16. * grow, shade, shade, 0., alpha));
+-
+-        if let Some((at, started)) = self.ripple {
+-            let t = progress(started, now, CURSOR_RIPPLE);
+-            if t < 1. {
+-                let e = ease_out_cubic(t);
+-                let from = cursor_color(CURSOR_FROM, 0.9);
+-                let to = cursor_color(CURSOR_TO, 0.9);
+-                let width = (2.5 - 1.5 * e) as f32;
+-                push(circle(at, 14. + 42. * e, from, to, width, (1. - e) as f32));
+-            }
+-        }
+-
+-        // The halo tightens while a button is held.
+-        let (halo, halo_alpha) = if self.pressed { (24., 0.3) } else { (34., 0.16) };
+-        let from = cursor_color(CURSOR_FROM, halo_alpha);
+-        let to = cursor_color(CURSOR_TO, halo_alpha);
+-        push(circle(center, halo * grow, from, to, 0., alpha));
++            .with_location(origin + at - Point::from((diameter / 2., diameter / 2.))),
++        );
+     }
+ }
+ 
+@@ -272,6 +354,52 @@
+ }
+ 
+ impl AgentInputState {
++    fn context_tint(&mut self, window_id: u64, agent_id: Option<&str>) -> Result<[f32; 3], String> {
++        let tints = &mut self.context_tints;
++        if let Some((_, tint)) = tints
++            .entries
++            .iter()
++            .find(|(id, _)| id.as_deref() == agent_id)
++        {
++            return Ok(*tint);
++        }
++        if tints.entries.len() == MAX_AGENT_CONTEXTS {
++            let inactive = tints
++                .entries
++                .iter()
++                .position(|(id, _)| {
++                    !self.cursors.iter().any(|(window, cursor)| {
++                        *window != window_id && cursor.agent_id.as_deref() == id.as_deref()
++                    })
++                })
++                .ok_or_else(|| {
++                    format!("maximum of {MAX_AGENT_CONTEXTS} active agent contexts reached")
++                })?;
++            tints.entries.remove(inactive);
++        }
++        let hue = (tints.hash_keys.hash_one(agent_id) & 0xffffff) as f32 / 16777216. * 6.;
++        let tint = cursor_tint_for_hue(hue);
++        tints.entries.push_back((agent_id.map(str::to_owned), tint));
++        Ok(tint)
++    }
++
++    fn move_cursor(
++        &mut self,
++        window_id: u64,
++        pos: Point<f64, Logical>,
++        now: Instant,
++        agent_id: Option<&str>,
++        tint: [f32; 3],
++    ) {
++        self.cursors
++            .entry(window_id)
++            .and_modify(|cursor| {
++                cursor.set_context(agent_id, tint);
++                cursor.move_to(pos, now);
++            })
++            .or_insert_with(|| AgentCursor::new(pos, now, agent_id, tint));
++    }
++
+     fn next_serial(&mut self) -> u32 {
+         let serial = SERIAL_COUNTER.next_serial();
+         if self.serials.len() == 1024 {
+@@ -377,7 +505,12 @@
+ }
+ 
+ impl State {
+-    pub fn agent_input(&mut self, window_id: u64, events: Vec<AgentEvent>) -> Result<(), String> {
++    pub fn agent_input(
++        &mut self,
++        window_id: u64,
++        events: Vec<AgentEvent>,
++        agent_id: Option<String>,
++    ) -> Result<(), String> {
+         let (window, toplevel) = self
+             .niri
+             .layout
+@@ -404,6 +537,10 @@
+         {
+             return Err(String::from("target client holds the real keyboard focus"));
+         }
++        let tint = self
++            .niri
++            .agent_input
++            .context_tint(window_id, agent_id.as_deref())?;
+         self.agent_mark_window(window_id);
+ 
+         // Drop state that belongs to dead surfaces or another client.
+@@ -466,6 +603,9 @@
+                 || self.niri.agent_input.pointer_real_enter != pointer.last_enter());
+ 
+         let geometry_loc = window.geometry().loc.to_f64();
++        if let Some(cursor) = self.niri.agent_input.cursors.get_mut(&window_id) {
++            cursor.set_context(agent_id.as_deref(), tint);
++        }
+ 
+         for event in events {
+             match event {
+@@ -494,12 +634,13 @@
+                     self.niri.agent_input.pointer = Some(surface);
+                     self.niri.agent_input.pointer_real_enter = pointer.last_enter();
+                     let (pos, now) = (Point::from((x, y)), Instant::now());
+-                    self.niri
+-                        .agent_input
+-                        .cursors
+-                        .entry(window_id)
+-                        .and_modify(|c| c.move_to(pos, now))
+-                        .or_insert_with(|| AgentCursor::new(pos, now));
++                    self.niri.agent_input.move_cursor(
++                        window_id,
++                        pos,
++                        now,
++                        agent_id.as_deref(),
++                        tint,
++                    );
+                 }
+                 AgentEvent::Button { button, pressed } => {
+                     if self.niri.agent_input.pointer.is_none() {
+@@ -1201,9 +1342,18 @@
+         self.layout.with_windows_mut(|mapped, output| {
+             let id = mapped.id().get();
+             mapped.set_is_agent_driven(windows.contains_key(&id));
+-            let cursor = cursors.get(&id).copied();
++            let cursor = cursors.get(&id).cloned().map(|mut cursor| {
++                let scale = output.map_or(1, |output| output.current_scale().integer_scale());
++                cursor.image = self.cursor_manager.agent_cursor_image(
++                    scale,
++                    self.start_time.elapsed().as_millis() as u32,
++                    &self.cursor_texture_cache,
++                );
++                cursor
++            });
++            let animating = cursor.as_ref().is_some_and(|c| c.is_animating(now));
+             let changed = mapped.set_agent_cursor(cursor);
+-            if changed || cursor.is_some_and(|c| c.is_animating(now)) {
++            if changed || animating {
+                 redraw.extend(output.cloned());
+             }
+         });
+@@ -1212,3 +1362,133 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod themed_cursor_tests {
++    use super::*;
++
++    #[test]
++    fn context_tint_survives_windows_leave_expiry_and_fifo_eviction() {
++        let mut state = AgentInputState::default();
++        let now = Instant::now();
++        let tint = state.context_tint(1, Some("agent-a")).unwrap();
++        state.move_cursor(1, (10., 20.).into(), now, Some("agent-a"), tint);
++        state.move_cursor(2, (30., 40.).into(), now, Some("agent-a"), tint);
++        assert_eq!(state.cursors[&1].tint, state.cursors[&2].tint);
++        state.cursors.remove(&1); // PointerLeave.
++        assert_eq!(state.context_tint(1, Some("agent-a")).unwrap(), tint);
++        // The same retention as refresh_mapped_agent_state after indicators expire.
++        state.cursors.retain(|id, _| state.windows.contains_key(id));
++        assert!(state.cursors.is_empty());
++        assert_eq!(state.context_tint(3, Some("agent-a")).unwrap(), tint);
++        for i in 0..MAX_AGENT_CONTEXTS {
++            state
++                .context_tint(4, Some(&format!("inactive-{i}")))
++                .unwrap();
++        }
++        assert!(!state
++            .context_tints
++            .entries
++            .iter()
++            .any(|(id, _)| id.as_deref() == Some("agent-a")));
++        let revived = state.context_tint(3, Some("agent-a")).unwrap();
++        state.move_cursor(3, (50., 60.).into(), now, Some("agent-a"), revived);
++        assert_eq!(state.cursors[&3].tint, tint);
++        assert_eq!(state.context_tints.entries.len(), MAX_AGENT_CONTEXTS);
++        let legacy = state.context_tint(5, None).unwrap();
++        assert_eq!(state.context_tint(6, None).unwrap(), legacy);
++    }
++
++    #[test]
++    fn latest_context_changes_window_tint_and_render_identity() {
++        let mut state = AgentInputState::default();
++        let now = Instant::now();
++        let first = state.context_tint(1, Some("agent-a")).unwrap();
++        state.move_cursor(1, (10., 20.).into(), now, Some("agent-a"), first);
++        let source = Id::new();
++        let id = state.cursors[&1].render_id(&source);
++        let second = state.context_tint(1, Some("agent-b")).unwrap();
++        state.move_cursor(1, (30., 40.).into(), now, Some("agent-b"), second);
++        assert_eq!(state.cursors[&1].agent_id.as_deref(), Some("agent-b"));
++        assert_eq!(state.cursors[&1].tint, second);
++        assert_ne!(state.cursors[&1].render_id(&source), id);
++        assert_eq!(state.context_tints.entries.len(), 2);
++        assert_eq!(state.context_tint(2, Some("agent-a")).unwrap(), first);
++        assert_eq!(state.context_tint(2, Some("agent-b")).unwrap(), second);
++    }
++
++    #[test]
++    fn cache_preserves_active_contexts_and_refuses_overflow() {
++        let mut state = AgentInputState::default();
++        let now = Instant::now();
++        for window in 0..MAX_AGENT_CONTEXTS as u64 {
++            let context = format!("active-{window}");
++            let tint = state.context_tint(window, Some(&context)).unwrap();
++            state.move_cursor(window, (0., 0.).into(), now, Some(&context), tint);
++        }
++        let entries = state.context_tints.entries.clone();
++        assert!(state.context_tint(999, Some("overflow")).is_err());
++        assert_eq!(state.context_tints.entries, entries);
++        // Replacing one window frees its old context only if no other window uses it.
++        state.cursors.insert(1000, state.cursors[&0].clone());
++        assert!(state.context_tint(0, Some("replacement")).is_err());
++        assert_eq!(state.context_tints.entries, entries);
++        state.cursors.remove(&1000);
++        let tint = state.context_tint(0, Some("replacement")).unwrap();
++        state.move_cursor(0, (0., 0.).into(), now, Some("replacement"), tint);
++        assert_eq!(state.context_tints.entries.len(), MAX_AGENT_CONTEXTS);
++        assert!(!state
++            .context_tints
++            .entries
++            .iter()
++            .any(|(id, _)| id.as_deref() == Some("active-0")));
++        for window in 1..MAX_AGENT_CONTEXTS {
++            let context = format!("active-{window}");
++            assert_eq!(
++                state.context_tint(window as u64, Some(&context)).unwrap(),
++                state.cursors[&(window as u64)].tint
++            );
++        }
++        state.cursors.remove(&1);
++        state.context_tint(999, Some("new-context")).unwrap();
++        assert_eq!(state.context_tints.entries.len(), MAX_AGENT_CONTEXTS);
++        assert!(!state
++            .context_tints
++            .entries
++            .iter()
++            .any(|(id, _)| id.as_deref() == Some("active-1")));
++        for i in 0..MAX_AGENT_CONTEXTS * 4 {
++            state.context_tint(999, Some(&format!("idle-{i}"))).unwrap();
++            assert_eq!(state.context_tints.entries.len(), MAX_AGENT_CONTEXTS);
++        }
++    }
++
++    #[test]
++    fn tint_survives_motion_buttons_and_window_sync() {
++        let now = Instant::now();
++        let mut cursor = AgentCursor::new((10., 20.).into(), now, Some("agent-a"), [0.3, 0.9, 0.5]);
++        let tint = cursor.tint;
++        cursor.move_to((50., 60.).into(), now + Duration::from_millis(40));
++        cursor.set_pressed(true, now + Duration::from_millis(80));
++        cursor.set_pressed(false, now + Duration::from_millis(120));
++        // Window sync changes the image, not the agent's identity or tint.
++        let mut mapped = cursor.clone();
++        mapped.image = AgentCursorImage::Hidden;
++        assert_eq!(mapped.tint, tint);
++        assert_eq!(cursor.tint, tint);
++        assert_eq!(cursor.position(now + CURSOR_GLIDE * 2), (50., 60.).into());
++    }
++
++    #[test]
++    fn damage_ids_are_stable_and_independent_of_human_and_other_agents() {
++        let now = Instant::now();
++        let cursor = AgentCursor::new((0., 0.).into(), now, Some("agent-a"), [0.3, 0.9, 0.5]);
++        let other = AgentCursor::new((0., 0.).into(), now, Some("agent-a"), [0.3, 0.9, 0.5]);
++        let human = Id::new();
++        let id = cursor.render_id(&human);
++        assert_ne!(id, human);
++        assert_eq!(cursor.clone().render_id(&human), id);
++        assert_ne!(other.render_id(&human), id);
++        assert_ne!(cursor.render_id(&Id::new()), id);
++    }
++}
+diff --git a/src/cursor.rs b/src/cursor.rs
+--- a/src/cursor.rs
++++ b/src/cursor.rs
+@@ -91,6 +91,37 @@
+                 scale,
+                 cursor: self.get_default_cursor(scale),
+             })
++    }
++
++    /// Snapshot the human cursor image without changing its provider or buffers.
++    pub fn agent_cursor_image(
++        &self,
++        scale: i32,
++        millis: u32,
++        textures: &CursorTextureCache,
++    ) -> AgentCursorImage {
++        match self.get_render_cursor(scale) {
++            RenderCursor::Hidden => AgentCursorImage::Hidden,
++            RenderCursor::Surface { hotspot, surface } => {
++                AgentCursorImage::Surface { hotspot, surface }
++            }
++            RenderCursor::Named {
++                icon,
++                scale,
++                cursor,
++            } => {
++                let (idx, frame) = cursor.frame(millis);
++                let hotspot = XCursor::hotspot(frame).to_logical(scale);
++                let buffer = textures.get(icon, scale, &cursor, idx);
++                AgentCursorImage::Named {
++                    cursor,
++                    idx,
++                    scale,
++                    hotspot,
++                    buffer,
++                }
++            }
++        }
+     }
+ 
+     pub fn is_current_cursor_animated(&self, scale: i32) -> bool {
+@@ -270,6 +301,7 @@
+ // The XCursorBuffer implementation is inspired by `wayland-rs`, thus provided under MIT license.
+ 
+ /// The state of the `NamedCursor`.
++#[derive(Debug)]
+ pub struct XCursor {
+     /// The image for the underlying named cursor.
+     images: Vec<Image>,
+@@ -316,3 +348,106 @@
+         (image.xhot as i32, image.yhot as i32).into()
+     }
+ }
++
++/// The same image and frame as the physical pointer, with an independent render identity.
++#[derive(Debug, Clone)]
++pub enum AgentCursorImage {
++    Hidden,
++    Surface {
++        hotspot: Point<i32, Logical>,
++        surface: WlSurface,
++    },
++    Named {
++        cursor: Rc<XCursor>,
++        idx: usize,
++        scale: i32,
++        hotspot: Point<i32, Logical>,
++        buffer: MemoryRenderBuffer,
++    },
++}
++
++impl AgentCursorImage {
++    pub fn is_animated(&self) -> bool {
++        matches!(self, Self::Named { cursor, .. } if cursor.is_animated_cursor())
++    }
++}
++
++impl PartialEq for AgentCursorImage {
++    fn eq(&self, other: &Self) -> bool {
++        match (self, other) {
++            (Self::Hidden, Self::Hidden) => true,
++            (
++                Self::Surface {
++                    hotspot: a,
++                    surface: sa,
++                },
++                Self::Surface {
++                    hotspot: b,
++                    surface: sb,
++                },
++            ) => a == b && sa == sb,
++            (
++                Self::Named {
++                    cursor: a,
++                    idx: ia,
++                    scale: sa,
++                    ..
++                },
++                Self::Named {
++                    cursor: b,
++                    idx: ib,
++                    scale: sb,
++                    ..
++                },
++            ) => Rc::ptr_eq(a, b) && ia == ib && sa == sb,
++            _ => false,
++        }
++    }
++}
++
++#[cfg(test)]
++mod themed_cursor_tests {
++    use super::*;
++
++    #[test]
++    fn snapshot_reuses_theme_frames_scale_hotspot_and_animation() {
++        let frames = vec![
++            Image {
++                size: 24, width: 4, height: 6, xhot: 2, yhot: 4, delay: 10,
++                pixels_rgba: vec![11; 4 * 6 * 4], pixels_argb: vec![],
++            },
++            Image {
++                size: 24, width: 6, height: 8, xhot: 4, yhot: 6, delay: 20,
++                pixels_rgba: vec![22; 6 * 8 * 4], pixels_argb: vec![],
++            },
++        ];
++        let source = Rc::new(XCursor { images: frames, animation_duration: 30 });
++        let mut manager = CursorManager {
++            theme: CursorTheme::load("default"), size: 24,
++            current_cursor: CursorImageStatus::Named(CursorIcon::Default),
++            named_cursor_cache: Default::default(),
++        };
++        manager.named_cursor_cache.get_mut().insert((CursorIcon::Default, 2), Some(source.clone()));
++        let textures = CursorTextureCache::default();
++        let first = manager.agent_cursor_image(2, 0, &textures);
++        let next = manager.agent_cursor_image(2, 10, &textures);
++        assert!(first.is_animated());
++        assert_eq!(first, manager.agent_cursor_image(2, 30, &textures));
++        assert_ne!(first, next);
++        match next {
++            AgentCursorImage::Named { cursor, idx, scale, hotspot, .. } => {
++                assert!(Rc::ptr_eq(&cursor, &source));
++                assert_eq!(idx, 1);
++                assert_eq!(scale, 2);
++                assert_eq!(hotspot, (2, 3).into());
++                assert_eq!((cursor.frames()[idx].width, cursor.frames()[idx].height), (6, 8));
++            }
++            _ => panic!("expected the original named theme cursor"),
++        }
++        assert_eq!(source.frames()[0].pixels_rgba, vec![11; 4 * 6 * 4]);
++        assert_eq!(source.frames()[1].pixels_rgba, vec![22; 6 * 8 * 4]);
++        assert!(matches!(manager.cursor_image(), CursorImageStatus::Named(CursorIcon::Default)));
++        manager.set_cursor_image(CursorImageStatus::Hidden);
++        assert_eq!(manager.agent_cursor_image(2, 10, &textures), AgentCursorImage::Hidden);
++    }
++}
+diff --git a/src/layout/tile.rs b/src/layout/tile.rs
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -28,6 +28,7 @@
+ use crate::render_helpers::shadow::ShadowRenderElement;
+ use crate::render_helpers::snapshot::RenderSnapshot;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
++use crate::render_helpers::tinted_cursor::TintedCursorRenderElement;
+ use crate::render_helpers::xray::{Xray, XrayPos};
+ use crate::render_helpers::{RenderCtx, RenderTarget};
+ use crate::utils::transaction::Transaction;
+@@ -128,6 +129,7 @@
+         Opening = OpeningWindowRenderElement,
+         Resize = ResizeRenderElement,
+         Border = BorderRenderElement,
++        AgentCursor = TintedCursorRenderElement<R>,
+         Shadow = ShadowRenderElement,
+         ClippedSurface = ClippedSurfaceRenderElement<R>,
+         Offscreen = OffscreenRenderElement,
+@@ -442,7 +444,12 @@
+     }
+ 
+     pub fn are_animations_ongoing(&self) -> bool {
+-        self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
++        self.are_transitions_ongoing()
++            || self.window.rules().baba_is_float == Some(true)
++            || self
++                .window
++                .agent_cursor()
++                .is_some_and(|cursor| cursor.is_animating(std::time::Instant::now()))
+     }
+ 
+     pub fn are_transitions_ongoing(&self) -> bool {
+@@ -1076,8 +1083,13 @@
+ 
+         // The computer-use agent pointer goes above everything, including popups.
+         if let Some(cursor) = self.window.agent_cursor() {
++            cursor.render(ctx.renderer, window_render_loc, scale, &mut |elem| {
++                push(elem.into())
++            });
+             if BorderRenderElement::has_shader(ctx.renderer) {
+-                cursor.render(window_render_loc, scale.x as f32, &mut |elem| push(elem.into()));
++                cursor.render_ripple(window_render_loc, scale.x as f32, &mut |elem| {
++                    push(elem.into())
++                });
+             }
+         }
+ 
+diff --git a/src/window/mapped.rs b/src/window/mapped.rs
+--- a/src/window/mapped.rs
++++ b/src/window/mapped.rs
+@@ -1011,7 +1011,7 @@
+     }
+ 
+     fn agent_cursor(&self) -> Option<AgentCursor> {
+-        self.agent_cursor
++        self.agent_cursor.clone()
+     }
+ 
+     fn set_activated(&mut self, active: bool) {
+diff --git a/src/render_helpers/mod.rs b/src/render_helpers/mod.rs
+--- a/src/render_helpers/mod.rs
++++ b/src/render_helpers/mod.rs
+@@ -49,6 +49,7 @@
+ pub mod solid_color;
+ pub mod surface;
+ pub mod texture;
++pub mod tinted_cursor;
+ pub mod xray;
+ 
+ /// A rendering context.
+diff --git a/src/render_helpers/shaders/mod.rs b/src/render_helpers/shaders/mod.rs
+--- a/src/render_helpers/shaders/mod.rs
++++ b/src/render_helpers/shaders/mod.rs
+@@ -17,6 +17,7 @@
+     pub postprocess_and_clip: Option<GlesTexProgram>,
+     pub resize: Option<ShaderProgram>,
+     pub gradient_fade: Option<GlesTexProgram>,
++    pub agent_cursor_tint: Option<GlesTexProgram>,
+     pub blur: Option<BlurProgram>,
+     pub custom_resize: RefCell<Option<ShaderProgram>>,
+     pub custom_close: RefCell<Option<ShaderProgram>>,
+@@ -142,6 +143,14 @@
+             })
+             .ok();
+ 
++        let agent_cursor_tint = renderer
++            .compile_custom_texture_shader(
++                include_str!("agent_cursor_tint.frag"),
++                &[UniformName::new("agent_tint", UniformType::_3f)],
++            )
++            .map_err(|err| warn!("error compiling agent cursor tint shader: {err:?}"))
++            .ok();
++
+         let blur = BlurProgram::compile(renderer)
+             .map_err(|err| {
+                 warn!("error compiling blur shaders: {err:?}");
+@@ -155,6 +164,7 @@
+             postprocess_and_clip,
+             resize,
+             gradient_fade,
++            agent_cursor_tint,
+             blur,
+             custom_resize: RefCell::new(None),
+             custom_close: RefCell::new(None),
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -128,6 +128,9 @@
+     AgentInput {
+         /// Id of the target window.
+         window_id: u64,
++        /// Agent context identity, stable for the agent process lifetime.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        agent_id: Option<String>,
+         /// Events to deliver, in order.
+         events: Vec<AgentEvent>,
+     },
+@@ -2175,6 +2178,31 @@
+     use super::*;
+ 
+     #[test]
++    fn themed_cursor_agent_input_accepts_old_and_context_requests() {
++        for json in [
++            r#"{"AgentInput":{"window_id":1,"events":[]}}"#,
++            r#"{"AgentInput":{"window_id":1,"events":[],"agent_id":null}}"#,
++        ] {
++            let request: Request = serde_json::from_str(json).unwrap();
++            assert!(matches!(
++                request,
++                Request::AgentInput { agent_id: None, .. }
++            ));
++            assert_eq!(
++                serde_json::to_value(request).unwrap(),
++                serde_json::json!({"AgentInput":{"window_id":1,"events":[]}})
++            );
++        }
++        let json =
++            serde_json::json!({"AgentInput":{"window_id":2,"events":[],"agent_id":"12ab34cd"}});
++        let request: Request = serde_json::from_value(json.clone()).unwrap();
++        assert!(
++            matches!(&request, Request::AgentInput { agent_id: Some(id), .. } if id == "12ab34cd")
++        );
++        assert_eq!(serde_json::to_value(request).unwrap(), json);
++    }
++
++    #[test]
+     fn parse_size_change() {
+         assert_eq!(
+             "10".parse::<SizeChange>().unwrap(),
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -455,10 +455,14 @@
+             let casts = state.casts.casts.values().cloned().collect();
+             Response::Casts(casts)
+         }
+-        Request::AgentInput { window_id, events } => {
++        Request::AgentInput {
++            window_id,
++            events,
++            agent_id,
++        } => {
+             let (tx, rx) = async_channel::bounded(1);
+             ctx.event_loop.insert_idle(move |state| {
+-                let result = state.agent_input(window_id, events);
++                let result = state.agent_input(window_id, events, agent_id);
+                 let _ = tx.send_blocking(result);
+             });
+             let result = rx.recv().await;
+diff --git a/src/render_helpers/tinted_cursor.rs b/src/render_helpers/tinted_cursor.rs
+new file mode 100644
+--- /dev/null
++++ b/src/render_helpers/tinted_cursor.rs
+@@ -0,0 +1,149 @@
++use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
++use smithay::backend::renderer::gles::{
++    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
++};
++use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
++use smithay::utils::user_data::UserDataMap;
++use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
++
++use super::renderer::{AsGlesFrame as _, NiriRenderer};
++use super::shaders::Shaders;
++use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
++use crate::niri::PointerRenderElements;
++
++#[derive(Debug)]
++pub struct TintedCursorRenderElement<R: NiriRenderer> {
++    inner: PointerRenderElements<R>,
++    id: Id,
++    program: GlesTexProgram,
++    tint: [f32; 3],
++}
++
++impl<R: NiriRenderer> TintedCursorRenderElement<R> {
++    pub fn new(
++        inner: PointerRenderElements<R>,
++        id: Id,
++        program: GlesTexProgram,
++        tint: [f32; 3],
++    ) -> Self {
++        Self {
++            inner,
++            id,
++            program,
++            tint,
++        }
++    }
++
++    pub fn shader(renderer: &mut R) -> Option<GlesTexProgram> {
++        Shaders::get(renderer).agent_cursor_tint.clone()
++    }
++
++    fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
++        vec![Uniform::new(
++            "agent_tint",
++            (self.tint[0], self.tint[1], self.tint[2]),
++        )]
++    }
++}
++
++impl<R: NiriRenderer> Element for TintedCursorRenderElement<R> {
++    fn id(&self) -> &Id {
++        &self.id
++    }
++
++    fn current_commit(&self) -> CommitCounter {
++        self.inner.current_commit()
++    }
++
++    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
++        self.inner.geometry(scale)
++    }
++
++    fn src(&self) -> Rectangle<f64, Buffer> {
++        self.inner.src()
++    }
++
++    fn transform(&self) -> Transform {
++        self.inner.transform()
++    }
++
++    fn damage_since(
++        &self,
++        scale: Scale<f64>,
++        commit: Option<CommitCounter>,
++    ) -> DamageSet<i32, Physical> {
++        self.inner.damage_since(scale, commit)
++    }
++
++    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
++        self.inner.opaque_regions(scale)
++    }
++
++    fn alpha(&self) -> f32 {
++        self.inner.alpha()
++    }
++
++    fn kind(&self) -> Kind {
++        self.inner.kind()
++    }
++}
++
++impl RenderElement<GlesRenderer> for TintedCursorRenderElement<GlesRenderer> {
++    fn draw(
++        &self,
++        frame: &mut GlesFrame<'_, '_>,
++        src: Rectangle<f64, Buffer>,
++        dst: Rectangle<i32, Physical>,
++        damage: &[Rectangle<i32, Physical>],
++        opaque_regions: &[Rectangle<i32, Physical>],
++        cache: Option<&UserDataMap>,
++    ) -> Result<(), GlesError> {
++        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
++        let result = RenderElement::<GlesRenderer>::draw(
++            &self.inner,
++            frame,
++            src,
++            dst,
++            damage,
++            opaque_regions,
++            cache,
++        );
++        frame.clear_tex_program_override();
++        result
++    }
++
++    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
++        // Scanout would bypass the agent tint shader.
++        None
++    }
++}
++
++impl<'render> RenderElement<TtyRenderer<'render>>
++    for TintedCursorRenderElement<TtyRenderer<'render>>
++{
++    fn draw(
++        &self,
++        frame: &mut TtyFrame<'render, '_, '_>,
++        src: Rectangle<f64, Buffer>,
++        dst: Rectangle<i32, Physical>,
++        damage: &[Rectangle<i32, Physical>],
++        opaque_regions: &[Rectangle<i32, Physical>],
++        cache: Option<&UserDataMap>,
++    ) -> Result<(), TtyRendererError<'render>> {
++        frame
++            .as_gles_frame()
++            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
++        let result =
++            RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
++        frame.as_gles_frame().clear_tex_program_override();
++        result
++    }
++
++    fn underlying_storage(
++        &self,
++        _renderer: &mut TtyRenderer<'render>,
++    ) -> Option<UnderlyingStorage<'_>> {
++        // Scanout would bypass the agent tint shader.
++        None
++    }
++}
+diff --git a/src/render_helpers/shaders/agent_cursor_tint.frag b/src/render_helpers/shaders/agent_cursor_tint.frag
+new file mode 100644
+--- /dev/null
++++ b/src/render_helpers/shaders/agent_cursor_tint.frag
+@@ -0,0 +1,41 @@
++#version 100
++
++//_DEFINES_
++
++#if defined(EXTERNAL)
++#extension GL_OES_EGL_image_external : require
++#endif
++
++precision highp float;
++#if defined(EXTERNAL)
++uniform samplerExternalOES tex;
++#else
++uniform sampler2D tex;
++#endif
++
++uniform float alpha;
++uniform vec3 agent_tint;
++varying vec2 v_coords;
++
++#if defined(DEBUG_FLAGS)
++uniform float tint;
++#endif
++
++void main() {
++    vec4 color = texture2D(tex, v_coords);
++#if defined(NO_ALPHA)
++    color = vec4(color.rgb, 1.0);
++#endif
++
++    // Keep premultiplied alpha and the theme's shading, including transparent edge pixels.
++    float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
++    color.rgb = agent_tint * (0.25 * color.a + 0.75 * luminance);
++    color *= alpha;
++
++#if defined(DEBUG_FLAGS)
++    if (tint == 1.0)
++        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
++#endif
++
++    gl_FragColor = color;
++}

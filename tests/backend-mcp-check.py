@@ -69,7 +69,9 @@ try:
                 'DBUS_STARTER_BUS_TYPE', 'AT_SPI_BUS_ADDRESS', 'NIRI_CONFIG',
                 'NIRI_AGENT_LAUNCH', 'MANAGERPID', 'SYSTEMD_EXEC_PID']:
         env.pop(key, None)
+    # The private session has no systemd manager for accessibility-bus activation.
     env.update(XDG_RUNTIME_DIR=runtime.name, WINIT_UNIX_BACKEND='x11',
+               ATSPI_DBUS_IMPLEMENTATION='dbus-daemon', GIO_USE_VFS='local',
                LIBGL_ALWAYS_SOFTWARE='1', LP_NUM_THREADS='2', GALLIUM_DRIVER='llvmpipe')
     display = next(n for n in range(91, 110) if not Path(f'/tmp/.X11-unix/X{n}').exists())
     env['DISPLAY'] = f':{display}'
@@ -77,7 +79,24 @@ try:
     env['XAUTHORITY'] = str(auth)
     bus_log = (args.output / 'dbus.log').open('w')
     logs.append(bus_log)
-    bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
+    # Limit activation to AT-SPI; host portals mount FUSE paths in the test runtime.
+    services = Path(runtime.name) / 'dbus-services'
+    services.mkdir()
+    (services / 'org.a11y.Bus.service').symlink_to('/usr/share/dbus-1/services/org.a11y.Bus.service')
+    bus_config = Path(runtime.name) / 'dbus.conf'
+    bus_config.write_text(f'''<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir={runtime.name}</listen>
+  <auth>EXTERNAL</auth>
+  <servicedir>{services}</servicedir>
+  <policy context="default">
+    <allow own="*"/>
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+''')
+    bus = subprocess.Popen(['dbus-daemon', '--config-file=' + str(bus_config), '--nofork', '--print-address=1'],
                            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=bus_log, text=True, start_new_session=True)
     processes.append(bus)
@@ -110,6 +129,9 @@ input {
     }
 }
 ''')
+    theme = os.environ.get('NCCU_TEST_CURSOR_THEME')
+    if theme:
+        config.write_text(config.read_text() + '\ncursor { xcursor-theme ' + json.dumps(theme) + '; xcursor-size 24; }\n')
     subprocess.run([str(args.niri), 'validate', '-c', str(config)], env=env,
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
     niri = spawn([str(args.niri), '-c', str(config)], env, 'niri')
@@ -307,8 +329,61 @@ input {
     assert subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True) == pointer_before
     assert subprocess.check_output(['wl-paste', '--no-newline'], env=env) == clipboard_before
     assert focused() == human['id']
+    api_dir = root.parent / 'build/codex-desktop-linux/linux-features/computer-use-linux'
+    node = os.environ.get('NCCU_NODE') or shutil.which('node')
+    assert node and api_dir.is_dir(), 'Prepared native API sources and Node are required'
+    sandbox = ['bwrap', '--die-with-parent', '--unshare-user', '--unshare-pid',
+               '--unshare-ipc', '--unshare-net', '--ro-bind', '/', '/',
+               '--dev', '/dev', '--proc', '/proc', '--bind', runtime.name, runtime.name,
+               '--bind', str(args.output), str(args.output), '--', str(args.backend), 'mcp']
+    script = """
+import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const {createNativeBackendService} = await import(pathToFileURL(process.env.NCCU_API_DIR + '/native-backend-service.mjs'));
+const {installLinuxComputerUse} = await import(pathToFileURL(process.env.NCCU_API_DIR + '/native-client.mjs'));
+const sandbox = JSON.parse(process.env.NCCU_API_SANDBOX);
+const service = createNativeBackendService({command:sandbox[0],args:sandbox.slice(1),environment:{...process.env,CODEX_LINUX_APP_DIR:''}});
+globalThis.nodeRepl={write(){},rpc:(_,request)=>service.handleRpc(request)};
+try {
+ const cua = installLinuxComputerUse({});
+ const app = await cua.getApp({windowId:Number(process.env.NCCU_API_WINDOW)});
+ const state = JSON.parse(await app.getAXState({emit:false}));
+ assert.equal(state.accessibility_error, null, 'Native API accessibility failed');
+ const entry = state.accessibility_tree.find(node=>node.role==='text' && node.editable);
+ assert.ok(entry, 'Expected an editable entry: ' + JSON.stringify({accessibility_error:state.accessibility_error,nodes:state.accessibility_tree.slice(0,16)}));
+ await app.click(entry.index,{mouseButton:'l'});
+ await app.pressKey('Control_L+a');
+ await app.paste('native-api exact ✓ 🦊');
+ const fresh = JSON.parse(await app.getAXState({emit:false}));
+ const button = fresh.accessibility_tree.find(node=>node.role==='button' && node.name==='Click verification button');
+ assert.ok(button, 'Expected the fixture button: ' + JSON.stringify(fresh.accessibility_tree.slice(0,16)));
+ await app.click(button.index,{mouseButton:'l'});
+ const after = JSON.parse(await app.getAXState({emit:false}));
+ const scroll = after.accessibility_tree.find(node=>node.role==='scroll bar' && node.bounds);
+ assert.ok(scroll, 'Expected a bounded scroll bar: ' + JSON.stringify(after.accessibility_tree.slice(0,16)));
+ await app.scroll(scroll.index,'d',{pixels:200});
+ await app.getAXState({emit:false});
+ console.log('Native API indexed clicks, aliases, keys and paste passed.');
+} finally {service.shutdown();}
+"""
+    api_before = read_state('agent')
+    api_env = {**backend_env, 'NCCU_API_DIR': str(api_dir),
+               'NCCU_API_SANDBOX': json.dumps(sandbox), 'NCCU_API_WINDOW': str(agent['id'])}
+    run = subprocess.run([node, '--input-type=module'], input=script, env=api_env,
+                         text=True, capture_output=True, timeout=30)
+    (args.output / 'native-api.log').write_text(run.stdout + run.stderr)
+    assert run.returncode == 0, 'Native API checks failed; see native-api.log'
+    wait_for(lambda: read_state('agent')['text'] == 'native-api exact ✓ 🦊', 'native API exact text')
+    wait_for(lambda: read_state('agent')['clicks'] == api_before['clicks'] + 1, 'native API indexed button click')
+    wait_for(lambda: read_state('agent')['scroll'] > api_before['scroll'], 'native API indexed scrolling')
+    assert read_state('human')['text'] == 'human-before human-after', 'Native API keys reached the human'
+    assert focused() == human['id'], 'Native API changed human focus'
+    assert subprocess.check_output(['xdotool', 'getmouselocation', '--shell'], env=env, text=True) == pointer_before
+    assert subprocess.check_output(['wl-paste', '--no-newline'], env=env) == clipboard_before
     result = dict(binary_sha256={'niri': hashlib.sha256(args.niri.read_bytes()).hexdigest(), 'codex-computer-use-linux': hashlib.sha256(args.backend.read_bytes()).hexdigest()}, test_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ['backend-mcp-check.py', 'gtk-slider-fixture.py']}, status='passed', backend_mcp=True, background_text=True, background_click=True, background_scroll=True, background_keys=True, background_drag=True, strict_rejections=True, strict_refusal_count=len(strict_cases), drag_start=20, drag_value=read_state('agent')['slider'], drag_motion=read_state('agent')['drag_motion'],
                   network_isolation='bubblewrap-net',
+                  api_sha256={name: hashlib.sha256((api_dir / name).read_bytes()).hexdigest() for name in ['native-client.mjs', 'native-protocol.mjs', 'native-backend-service.mjs']},
+                  native_api=True, indexed_actions=True, documented_aliases=True,
                   background_unicode=True, offscreen_input=True, focused_client_refused=True,
                   human_focus_unchanged=True, human_pointer_unchanged=True, clipboard_unchanged=True,
                   input_streams_isolated=True, screenshot=screenshot, windows=windows())

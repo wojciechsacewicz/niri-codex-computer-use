@@ -1,0 +1,531 @@
+Subject: Keep native app actions and discovery compatible with the installed CUA API
+
+--- a/computer-use-linux/src/niri_agent.rs
++++ b/computer-use-linux/src/niri_agent.rs
+@@ -25,6 +25,7 @@
+ 
+ static SUPPORT: Mutex<Option<(String, bool)>> = Mutex::new(None);
+ static GEOMETRY: Mutex<Option<HashMap<u64, CaptureGeometry>>> = Mutex::new(None);
++static AGENT_CONTEXT: Mutex<Option<String>> = Mutex::new(None);
+ 
+ pub fn background_only() -> bool {
+     std::env::var("CODEX_COMPUTER_USE_NIRI_AGENT_REQUIRED").is_ok_and(|value| value == "1")
+@@ -158,8 +159,18 @@
+     ))
+ }
+ 
++fn agent_context() -> Result<String> {
++    let mut context = AGENT_CONTEXT.lock().unwrap_or_else(|error| error.into_inner());
++    if context.is_none() {
++        let mut nonce = [0u8; 16];
++        getrandom::fill(&mut nonce).map_err(|error| anyhow!("agent context nonce: {error}"))?;
++        *context = Some(nonce.iter().map(|byte| format!("{byte:02x}")).collect());
++    }
++    Ok(context.as_ref().unwrap().clone())
++}
++
+ pub async fn input(window_id: u64, events: Vec<Value>) -> Result<()> {
+-    request(json!({ "AgentInput": { "window_id": window_id, "events": events } }))
++    request(json!({ "AgentInput": { "window_id": window_id, "events": events, "agent_id": agent_context()? } }))
+         .await
+         .map(|_| ())
+ }
+--- a/computer-use-linux/src/server.rs
++++ b/computer-use-linux/src/server.rs
+@@ -573,6 +573,16 @@
+         if let Some(note) = off_screen_note {
+             caption["window_off_screen"] = serde_json::json!(true);
+             caption["off_screen_note"] = serde_json::json!(note);
++        }
++        if let Some(window) = native_window {
++            if let Some(geometry) = crate::niri_agent::capture_geometry(window.window_id) {
++                caption["target_geometry"] = serde_json::json!({
++                    "window_id": window.window_id,
++                    "scale": geometry.scale,
++                    "x": geometry.geometry_x,
++                    "y": geometry.geometry_y,
++                });
++            }
+         }
+         Ok(CallToolResult::success(vec![
+             Content::image(data_url_payload(&capture.data_url), capture.mime_type),
+@@ -5233,13 +5243,25 @@
+     }
+ }
+ 
++fn chromium_cursor_resources(executable: &std::path::Path) -> bool {
++    executable.parent().is_some_and(|directory| {
++        ["chrome_100_percent.pak", "chrome_200_percent.pak"]
++            .iter().any(|name| directory.join(name).is_file())
++    })
++}
++
+ fn chromium_browser_window(window: &WindowInfo) -> bool {
++    if window.pid.and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
++        .is_some_and(|executable| chromium_cursor_resources(&executable)) {
++        return true;
++    }
+     [window.app_id.as_deref(), window.wm_class.as_deref()]
+         .into_iter()
+         .flatten()
+         .any(|identity| {
+-            matches!(
+-                identity.to_ascii_lowercase().as_str(),
++            let identity = identity.to_ascii_lowercase();
++            identity.starts_with("chrome-") || matches!(
++                identity.as_str(),
+                 "microsoft-edge"
+                     | "microsoft-edge-stable"
+                     | "google-chrome"
+@@ -5248,6 +5270,9 @@
+                     | "chromium-browser"
+                     | "brave-browser"
+                     | "vivaldi-stable"
++                    | "helium"
++                    | "helium-browser"
++                    | "net.imput.helium"
+             )
+         })
+ }
+@@ -5810,10 +5835,14 @@
+ 
+ fn modifier_keycode(key: &str) -> Option<u16> {
+     match normalize_key(key).as_str() {
+-        "ctrl" | "control" => Some(29),
+-        "alt" | "option" => Some(56),
+-        "shift" => Some(42),
+-        "meta" | "super" | "cmd" | "command" => Some(125),
++        "ctrl" | "control" | "control_l" | "ctrl_l" => Some(29),
++        "control_r" | "ctrl_r" => Some(97),
++        "alt" | "option" | "alt_l" => Some(56),
++        "alt_r" | "iso_level3_shift" => Some(100),
++        "shift" | "shift_l" => Some(42),
++        "shift_r" => Some(54),
++        "meta" | "super" | "cmd" | "command" | "super_l" | "meta_l" => Some(125),
++        "super_r" | "meta_r" => Some(126),
+         _ => None,
+     }
+ }
+@@ -5822,10 +5851,11 @@
+     match normalize_key(key).as_str() {
+         "enter" | "return" => Some(28),
+         "escape" | "esc" => Some(1),
+-        "tab" => Some(15),
++        "tab" | "iso_left_tab" => Some(15),
+         "backspace" => Some(14),
+         "delete" | "del" => Some(111),
+         "space" => Some(57),
++        "insert" => Some(110),
+         "home" => Some(102),
+         "end" => Some(107),
+         "pageup" | "page_up" => Some(104),
+@@ -5846,6 +5876,22 @@
+         "f10" => Some(68),
+         "f11" => Some(87),
+         "f12" => Some(88),
++        "kp_0" | "kp_insert" => Some(82),
++        "kp_1" | "kp_end" => Some(79),
++        "kp_2" | "kp_down" => Some(80),
++        "kp_3" | "kp_next" => Some(81),
++        "kp_4" | "kp_left" => Some(75),
++        "kp_5" | "kp_begin" => Some(76),
++        "kp_6" | "kp_right" => Some(77),
++        "kp_7" | "kp_home" => Some(71),
++        "kp_8" | "kp_up" => Some(72),
++        "kp_9" | "kp_prior" => Some(73),
++        "kp_enter" => Some(96),
++        "kp_add" => Some(78),
++        "kp_subtract" => Some(74),
++        "kp_multiply" => Some(55),
++        "kp_divide" => Some(98),
++        "kp_decimal" | "kp_delete" => Some(83),
+         value if value.len() == 1 => keycode_for_ascii(value.as_bytes()[0] as char),
+         _ => None,
+     }
+@@ -5964,6 +6010,49 @@
+     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
+     use std::os::unix::fs::PermissionsExt;
+     use tokio::io::AsyncReadExt;
++
++    #[test]
++    fn electron_windows_are_detected_without_an_app_name_whitelist() {
++        let directory = crate::niri_agent::tempfile_dir().unwrap();
++        let executable = directory.join("custom-editor");
++        std::fs::copy("/usr/bin/sleep", &executable).unwrap();
++        let mut child = std::process::Command::new(&executable).arg("10").spawn().unwrap();
++        let window: WindowInfo = serde_json::from_value(serde_json::json!({
++            "window_id": 1, "app_id": "custom-editor", "pid": child.id(),
++            "focused": false, "hidden": false, "backend": "niri"
++        })).unwrap();
++        let before = chromium_browser_window(&window);
++        std::fs::write(directory.join("chrome_100_percent.pak"), []).unwrap();
++        let after = chromium_browser_window(&window);
++        child.kill().unwrap();
++        child.wait().unwrap();
++        std::fs::remove_dir_all(directory).unwrap();
++        assert!(!before);
++        assert!(after);
++    }
++
++    #[test]
++    fn native_keysym_modifier_and_keypad_names_are_supported() {
++        assert_eq!(key_chord("Control_L+a"), Some((vec![29], 30)));
++        assert_eq!(key_chord("Control_R+Shift_R+Left"), Some((vec![97, 54], 105)));
++        assert_eq!(key_chord("Super_L+d"), Some((vec![125], 32)));
++        assert_eq!(key_chord("KP_0"), Some((vec![], 82)));
++        assert_eq!(key_chord("KP_Enter"), Some((vec![], 96)));
++    }
++
++    #[test]
++    fn chromium_app_windows_and_helium_use_unicode_hex_input() {
++        for identity in ["helium", "helium-browser", "net.imput.helium", "chrome-example-Default", "google-chrome", "Microsoft-Edge"] {
++            let window: WindowInfo = serde_json::from_value(serde_json::json!({
++                "window_id": 1, "app_id": identity, "focused": false, "hidden": false, "backend": "niri"
++            })).unwrap();
++            assert!(chromium_browser_window(&window), "{identity}");
++        }
++        let window: WindowInfo = serde_json::from_value(serde_json::json!({
++            "window_id": 1, "app_id": "gtk-fixture", "focused": false, "hidden": false, "backend": "niri"
++        })).unwrap();
++        assert!(!chromium_browser_window(&window));
++    }
+ 
+     struct EnvVarGuard {
+         key: &'static str,
+--- a/linux-features/computer-use-linux/native-client.mjs
++++ b/linux-features/computer-use-linux/native-client.mjs
+@@ -53,11 +53,10 @@
+   const browserState = cua.getState?.bind(cua);
+   cua.listApps = async (options = {}) => {
+     const apps = await call('list_apps');
+-    const windows = nativeWindows(apps);
+-    return emit(apps.map((app, index) => ({ ...app, windows: [windows[index]] })), options);
++    return emit(apps.map(app => ({ ...app, windows: app.windows ?? nativeWindows([app]) })), options);
+   };
+   cua.listWindows = async (options = {}) => emit(nativeWindows(await call('list_apps')), options);
+-  cua.computer = { ...cua.computer,
++  cua.computer = { ...cua.computer, target: 'linux',
+     launch_app: async ({ app }) => { await call('launch_app', app); } };
+   const linuxState = async (options = {}) => {
+     const state = browserState ? await browserState({ emit: false }) : { browsers: [] };
+@@ -73,28 +72,15 @@
+     if (typeof app !== 'string' || !app.trim()) throw new Error('getApp requires a non-empty app id');
+     const unsupported = async () => { throw new Error('This native Linux Computer Use operation is not supported'); };
+     const state = options => call('get_app_state', app, { include_screenshot: false, ...axBackendOptions(options) });
+-    let previousAccessibilityState;
++    let observedTree;
+     const screenshotMetadata = (result) => result.screenshot ? {
+       width: result.screenshot.width, height: result.screenshot.height,
+       coordinate_width: result.screenshot.coordinate_width,
+       coordinate_height: result.screenshot.coordinate_height,
+     } : undefined;
+     const axText = (result, options) => {
++      observedTree = result.accessibility_tree;
+       const compactTree = Array.isArray(result.accessibility_tree) ? result.accessibility_tree.map(compactNode) : [];
+-      const accessibilityState = {
+-        accessibility_tree: compactTree,
+-        window_context: result.window_context,
+-        accessibility_error: result.accessibility_error,
+-        window_error: result.window_error,
+-      };
+-      const signature = JSON.stringify(accessibilityState);
+-      const unchanged = options?.disableDiffing !== true && options?.compact !== false && signature === previousAccessibilityState;
+-      previousAccessibilityState = signature;
+-      if (unchanged) return JSON.stringify({
+-        accessibility_tree_unchanged: true,
+-        screenshot_error: result.screenshot_error,
+-        screenshot: screenshotMetadata(result),
+-      });
+       return JSON.stringify({
+         accessibility_tree: options?.compact === false ? result.accessibility_tree : compactTree,
+         window_context: result.window_context,
+@@ -119,6 +105,54 @@
+       if (!Array.isArray(target) || target.length !== 2 || !target.every(Number.isInteger)) throw new Error('Linux native input requires integer window-relative coordinates');
+       return { x: target[0], y: target[1] };
+     };
++    const elementPoint = async index => {
++      if (!Number.isInteger(index) || index < 0) throw new Error('Invalid accessibility element index');
++      const observed = observedTree?.find(node => node.index === index);
++      if (!observed?.object_ref) throw new Error('Read the selected app accessibility state before using an element index');
++      const fresh = await state({});
++      const nodes = fresh.accessibility_tree ?? [];
++      const node = nodes.find(item => item.index === index);
++      if (node?.object_ref !== observed.object_ref) throw new Error('Accessibility element index is stale; read the app state again');
++      let frame = node;
++      const visited = new Set();
++      while (frame && !['frame', 'window', 'dialog'].includes(frame.role)) {
++        if (visited.has(frame.index)) throw new Error('Invalid accessibility ancestry');
++        visited.add(frame.index);
++        frame = nodes.find(item => item.index === frame.parent_index);
++      }
++      const bounds = node.bounds;
++      const origin = frame?.bounds;
++      if (!bounds || !origin || origin.width <= 0 || origin.height <= 0 ||
++          frame.name !== fresh.window_context?.title) {
++        throw new Error('Element has no verified target-window bounds; use screenshot coordinates');
++      }
++      const left = Math.max(0, bounds.x - origin.x);
++      const top = Math.max(0, bounds.y - origin.y);
++      const right = Math.min(origin.width, bounds.x - origin.x + bounds.width);
++      const bottom = Math.min(origin.height, bounds.y - origin.y + bounds.height);
++      if (left >= right || top >= bottom) throw new Error('Accessibility element is outside the target window');
++      // Capture supplies scale and popup offsets without activating the window.
++      const capture = (await call('screenshot', app)).screenshot;
++      const geometry = capture?.target_geometry;
++      const window = fresh.window_context?.bounds;
++      if (!geometry || geometry.window_id !== fresh.window_context?.window_id ||
++          !Number.isFinite(geometry.scale) || geometry.scale <= 0 ||
++          !window || window.width <= 0 || window.height <= 0 ||
++          !Number.isFinite(geometry.x) || !Number.isFinite(geometry.y)) {
++        throw new Error('Target screenshot geometry is unavailable; use screenshot coordinates');
++      }
++      return {
++        x: Math.round((left + right) / 2 * window.width / origin.width * geometry.scale + geometry.x),
++        y: Math.round((top + bottom) / 2 * window.height / origin.height * geometry.scale + geometry.y),
++      };
++    };
++    const inputPoint = location => typeof location === 'number' ? elementPoint(location) : Promise.resolve(point(location));
++    const alias = (value, values, name) => {
++      if (!Object.hasOwn(values, value)) throw new Error(`Unsupported ${name}: ${value}`);
++      return values[value];
++    };
++    const button = value => alias(value, {left:'left',l:'left',right:'right',r:'right',middle:'middle',m:'middle'}, 'mouse button');
++    const direction = value => alias(value, {up:'up',u:'up',down:'down',d:'down',left:'left',l:'left',right:'right',r:'right'}, 'scroll direction');
+     const target = {
+       getAXState: async (options = {}) => emit(axText(await state(options), options), options),
+       getScreenshot: async (options = {}) => screenshot(await call('screenshot', app, screenshotBackendOptions(options)), options),
+@@ -130,13 +164,19 @@
+         const result = { ...await state(options), ...capture };
+         return { state: emit(axText(result, options), options), ...(result.screenshot ? { screenshot: await screenshot(result, options) } : {}) };
+       },
+-      click: (location, options = {}) => call('click', app, { ...point(location), button: options.mouseButton ?? 'left', click_count: options.clickCount ?? 1, relative: true }),
+-      pressKey: key => call('press_key', app, { key }),
+-      typeText: text => call('type_text', app, { text }),
+-      scroll: (location, direction, distance = 1) => {
++      click: async (location, options = {}) => {
++        const mouse = button(options.mouseButton ?? 'left');
++        const count = options.clickCount ?? 1;
++        if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('Invalid click count');
++        await call('click', app, { ...await inputPoint(location), button: mouse, click_count: count, relative: true });
++      },
++      pressKey: async key => { await call('press_key', app, { key }); },
++      typeText: async text => { await call('type_text', app, { text }); },
++      scroll: async (location, scrollDirection, distance = 1) => {
++        const normalized = direction(scrollDirection);
+         const pages = typeof distance === 'object' && distance !== null ? distance.pixels / 600 : distance;
+         if (typeof pages !== 'number' || !Number.isFinite(pages) || pages <= 0) throw new Error('Linux scroll requires a positive distance or { pixels }');
+-        return call('scroll', app, { ...point(location), direction, pages, relative: true });
++        await call('scroll', app, { ...await inputPoint(location), direction: normalized, pages, relative: true });
+       },
+       paste: async (text, options = {}) => {
+         if (options.format && options.format !== 'text') return unsupported();
+@@ -154,7 +194,6 @@
+       toggleMaximize: () => call('toggle_maximize', app),
+       selectText: unsupported, setValue: unsupported, performSecondaryAction: unsupported,
+     };
+-    emit('Linux native app APIs: getAXState({disableDiffing?,compact?,maxNodes?,maxDepth?}), getScreenshot({maxWidth?,maxHeight?,maxBytes?,scale?,format?,quality?}), getAXStateAndScreenshot() with both option sets, click([x,y], {mouseButton?,clickCount?}), drag([startX,startY], [endX,endY]), toggleMaximize(), pressKey(key), typeText(text), scroll([x,y], direction, {pixels} or legacy pages?), paste(text). Pixel distances are quantized to wheel steps by the backend. AX state is compact and unchanged compact projections are suppressed by default; pass disableDiffing:true for a fresh compact tree or compact:false for full backend node metadata. Screenshot APIs emit images themselves. In niri background mode, capture and input keep the user\'s pointer, focus and workspace unchanged; getAXState() remains passive. Click/drag/scroll coordinates are window-relative in the reported screenshot coordinate_width/coordinate_height space; screenshots may be downscaled. Accessibility bounds are screen coordinates and must not be passed directly to click/scroll; display scaling can differ. Native window_context is retained for geometry inspection. Element-index actions, rich paste, selectText, setValue, and secondary actions are unsupported. Input uses the Linux backend and may require OS permissions.');
+     try { await target.getAXState(); }
+     catch (error) {
+       if (app.startsWith('linux-window:') || !/No window matched/i.test(error.message)) throw error;
+--- a/linux-features/computer-use-linux/native.test.js
++++ b/linux-features/computer-use-linux/native.test.js
+@@ -151,7 +151,7 @@
+ });
+ `);
+   const { createNativeBackendService } = await import('./native-backend-service.mjs');
+-  const service = createNativeBackendService({ command: process.execPath, args: [script], timeoutMs: 1000 });
++  const service = createNativeBackendService({ command: process.execPath, args: [script], timeoutMs: 1000, environment: {...process.env, CODEX_LINUX_APP_DIR:''} });
+   t.after(async () => { service.shutdown(); await rm(dir, {recursive:true,force:true}); });
+   return { ...service, readCalls: async () => (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line, (key, value, context) => key === 'window_id' ? context.source : value).params) };
+ }
+@@ -178,7 +178,7 @@
+   assert.deepEqual(calls.at(-1).arguments, {max_width:800,max_height:600,max_bytes:65536,scale:0.5,format:'jpeg',quality:70,app_id:'editor'});
+ });
+ 
+-test('native client compacts and suppresses repeated large accessibility observations', async () => {
++test('native Linux observations remain complete while omitting unused metadata', async () => {
+   const { installLinuxComputerUse } = await import('./native-client.mjs');
+   const original = globalThis.nodeRepl;
+   const calls = [], writes = [];
+@@ -220,7 +220,8 @@
+     assert.equal(button.text.content,undefined);
+ 
+     const repeated = JSON.parse(await app.getAXState({emit:false,maxNodes:20,maxDepth:5}));
+-    assert.deepEqual(repeated,{accessibility_tree_unchanged:true});
++    assert.equal(repeated.accessibility_tree.length,237);
++    assert.equal(repeated.accessibility_tree.at(-1).index,236);
+     assert.deepEqual(calls.at(-1).params,{include_screenshot:false,max_nodes:20,max_depth:5});
+ 
+     const refreshed = JSON.parse(await app.getAXState({emit:false,disableDiffing:true,max_nodes:21,max_depth:6}));
+@@ -342,7 +343,7 @@
+     response={accessibility_tree:[],screenshot_error:'capture unavailable'};
+     await assert.rejects(app.getScreenshot(),/capture unavailable/);
+     assert.match((await app.getAXStateAndScreenshot({emit:false})).state,/capture unavailable/);
+-    await assert.rejects(async()=>app.click(3),/element-index.*not supported/);
++    await assert.rejects(async()=>app.click(3),/Read the selected app accessibility state/);
+   } finally { globalThis.nodeRepl=original; }
+ });
+ 
+@@ -530,3 +531,50 @@
+     ]);
+   } finally { globalThis.nodeRepl = original; }
+ });
++
++for (const units of [1, 1.5]) {
++  test(`native indexed actions map ${units === 1 ? 'Wayland logical' : 'X11 physical'} AX units and popup offsets`, async () => {
++    const { installLinuxComputerUse } = await import('./native-client.mjs');
++    const old = globalThis.nodeRepl;
++    const calls = [];
++    let stale = false;
++    const tree = () => [
++      {index:1, role:'frame', name:'Test', object_ref:'frame', bounds:{x:100,y:200,width:800*units,height:600*units}},
++      {index:4, parent_index:1, role:'button', object_ref:stale?'replaced':'button', bounds:{x:100+20*units,y:200+40*units,width:100*units,height:40*units}},
++    ];
++    globalThis.nodeRepl = {write(){},rpc:async (_,request) => {
++      calls.push(request);
++      if(request.method === 'get_app_state') return {accessibility_tree:tree(),window_context:{title:'Test',window_id:22,bounds:{width:800,height:600}}};
++      if(request.method === 'screenshot') return {screenshot:{target_geometry:{window_id:22,scale:1.5,x:9,y:12}}};
++      return {ok:true};
++    }};
++    try {
++      const app = await installLinuxComputerUse({}).getApp({windowId:22});
++      await app.click(4,{mouseButton:'l',clickCount:2});
++      assert.deepEqual(calls.at(-1).params,{x:114,y:102,button:'left',click_count:2,relative:true});
++      await app.scroll(4,'d',{pixels:600});
++      assert.deepEqual(calls.at(-1).params,{x:114,y:102,direction:'down',pages:1,relative:true});
++      stale = true;
++      const before=calls.filter(c=>['click','scroll'].includes(c.method)).length;
++      await assert.rejects(app.click(4),/stale/);
++      await assert.rejects(app.scroll(4,'d'),/stale/);
++      await assert.rejects(app.click([2,3],{mouseButton:'invalid'}),/Unsupported mouse button/);
++      await assert.rejects(app.scroll([2,3],'invalid'),/Unsupported scroll direction/);
++      assert.equal(calls.filter(c=>['click','scroll'].includes(c.method)).length,before);
++    } finally {globalThis.nodeRepl=old;}
++  });
++}
++
++test('official installed-app catalog uses launchable IDs and deduplicates niri windows', async () => {
++  const {mergeNativeCatalog} = await import('./native-backend-service.mjs');
++  const {nativeWindows,nativeSkyApps} = await import('./native-protocol.mjs');
++  const catalog=[{id:'editor.desktop',name:'Editor',windows:[]},{id:'closed.desktop',name:'Closed',windows:[]}];
++  const windows=[{id:'linux-window:22',displayName:'editor',title:'One',isRunning:true},{id:'linux-window:23',displayName:'custom',title:'Two',isRunning:true}];
++  const apps=mergeNativeCatalog(catalog,windows);
++  assert.equal(apps[0].id,'editor.desktop');assert.equal(apps[0].isRunning,true);
++  assert.equal(apps[1].isRunning,false);assert.deepEqual(apps[1].windows,[]);
++  assert.equal(apps[2].id,'linux-window:23');
++  assert.deepEqual(nativeWindows(apps).map(window=>window.id),[22,23]);
++  assert.deepEqual(nativeSkyApps(apps).map(app=>app.name),['Editor','Closed','custom']);
++  assert.equal(nativeWindows([...apps,apps[0]]).length,2);
++});
+--- a/linux-features/computer-use-linux/native-protocol.mjs
++++ b/linux-features/computer-use-linux/native-protocol.mjs
+@@ -57,15 +57,16 @@
+ 
+ // Keep uint64 IDs as strings when JavaScript cannot represent them exactly.
+ export function nativeWindows(apps) {
+-  return apps.map(app => {
++  const windows = apps.flatMap(app => {
++    if (Array.isArray(app.windows)) return app.windows;
+     const rawId = app.id?.startsWith('linux-window:') ? app.id.slice('linux-window:'.length) : undefined;
+     if (!rawId || !/^\d+$/.test(rawId)) throw new Error('Native inventory returned an invalid window id');
+     const numericId = Number(rawId);
+-    return { id: Number.isSafeInteger(numericId) ? numericId : rawId, app: app.displayName, title: app.title };
++    return [{ id: Number.isSafeInteger(numericId) ? numericId : rawId, app: app.displayName, title: app.title }];
+   });
++  return [...new Map(windows.map(window => [String(window.id), window])).values()];
+ }
+ 
+ export function nativeSkyApps(apps) {
+-  const windows = nativeWindows(apps);
+-  return apps.map((app, index) => ({ id: app.id, name: app.displayName, windows: [windows[index]] }));
++  return apps.map(app => ({ id: app.id, name: app.displayName, windows: nativeWindows([app]) }));
+ }
+--- a/linux-features/computer-use-linux/native-backend-service.mjs
++++ b/linux-features/computer-use-linux/native-backend-service.mjs
+@@ -1,9 +1,34 @@
+-import { spawn } from 'node:child_process';
++import { spawn, execFile } from 'node:child_process';
+ import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+ import { basename, join } from 'node:path';
+ import { createInterface } from 'node:readline';
+ import { fileURLToPath } from 'node:url';
+-import { nativeTarget, validateNativeRequest } from './native-protocol.mjs';
++import { promisify } from 'node:util';
++import { nativeTarget, validateNativeRequest, nativeWindows } from './native-protocol.mjs';
++
++const executeFile = promisify(execFile);
++
++export function mergeNativeCatalog(catalog, windows) {
++  const used = new Set();
++  const apps = catalog.map(app => {
++    const identities = [app.id.replace(/\.desktop$/i, ''), app.name, ...app.windows.map(window => window.app)].map(value => value.toLocaleLowerCase());
++    const matched = windows.filter(window => identities.includes(window.displayName.toLocaleLowerCase()));
++    for (const window of matched) used.add(window.id);
++    return { id: app.id, displayName: app.name, isRunning: matched.length > 0, windows: nativeWindows(matched) };
++  });
++  return [...apps, ...windows.filter(window => !used.has(window.id))];
++}
++
++async function nativeCatalog(environment) {
++  if (!environment.CODEX_LINUX_APP_DIR) return null;
++  const binary = join(environment.CODEX_LINUX_APP_DIR, 'resources/cua_node/lib/node_modules/@oai/cua/bin/linux/sky_linux_' + (process.arch === 'x64' ? 'x64' : process.arch));
++  const child = executeFile(binary, ['list_apps'], {env:environment,timeout:10000,maxBuffer:8*1024*1024});
++  child.child.stdin.end('{}');
++  const {stdout} = await child;
++  const apps = JSON.parse(stdout);
++  if (!Array.isArray(apps) || apps.some(app => typeof app.id !== 'string' || typeof app.name !== 'string' || !Array.isArray(app.windows))) throw new Error('Official Linux app inventory contract changed');
++  return apps;
++}
+ 
+ // Only desktop entries advertised by the current session can be launched.
+ // Never interpret an app id as a command, path, URL, or shell fragment.
+@@ -145,15 +170,17 @@
+       const file = resolveDesktopEntry(app, environment);
+       const desktopId = basename(file, '.desktop').toLocaleLowerCase();
+       const existing = await handleRpc({ method: 'list_apps' });
+-      const running = existing.find(window => window.displayName?.toLocaleLowerCase() === desktopId);
+-      if (running) return running;
+-      const before = new Set(existing.map(window => window.id));
++      const candidates = inventory => inventory.flatMap(app => app.id?.toLocaleLowerCase() === (desktopId + '.desktop') || app.displayName?.toLocaleLowerCase() === desktopId ? nativeWindows([app]) : []);
++      const running = candidates(existing);
++      if (running.length > 1) throw new Error('Multiple app windows are open; select an exact windowId');
++      if (running.length === 1) return { id: 'linux-window:' + running[0].id };
++      const before = new Set(nativeWindows(existing).map(window => String(window.id)));
+       await runNativeCommand('gio', ['launch', file], launchEnvironment);
+       for (let attempt = 0; attempt < 60; attempt++) {
+         const windows = await handleRpc({ method: 'list_apps' });
+-        const created = windows.find(window => !before.has(window.id) && window.displayName?.toLocaleLowerCase() === desktopId) ??
+-          windows.find(window => !before.has(window.id));
+-        if (created) return created;
++        const created = candidates(windows).filter(window => !before.has(String(window.id)));
++        if (created.length > 1) throw new Error('Multiple new app windows appeared; select an exact windowId');
++        if (created.length === 1) return { id: 'linux-window:' + created[0].id };
+         await new Promise(resolve => setTimeout(resolve, 150));
+       }
+       throw new Error(`Application started, but no new desktop window appeared for ${app}`);
+@@ -186,7 +213,9 @@
+     }
+     if (method === 'list_apps') {
+       if (data.error) throw new Error(data.error);
+-      return data.windows.map(window => ({ id: `linux-window:${window.window_id}`, displayName: window.app_id || window.wm_class || window.title || 'Linux app', title: window.title, isRunning: true, focused: window.focused }));
++      const windows = data.windows.map(window => ({ id: `linux-window:${window.window_id}`, displayName: window.app_id || window.wm_class || window.title || 'Linux app', title: window.title, isRunning: true, focused: window.focused }));
++      const catalog = await nativeCatalog(environment);
++      return catalog ? mergeNativeCatalog(catalog, windows) : windows;
+     }
+     return data;
+   }
+--- a/linux-features/computer-use-linux/host-service.test.js
++++ b/linux-features/computer-use-linux/host-service.test.js
+@@ -34,6 +34,12 @@
+ }
+ 
+ test('host bridge validates requests before launching the unsandboxed backend', async t => {
++  const appDir = process.env.CODEX_LINUX_APP_DIR;
++  process.env.CODEX_LINUX_APP_DIR = '';
++  t.after(() => {
++    if (appDir === undefined) delete process.env.CODEX_LINUX_APP_DIR;
++    else process.env.CODEX_LINUX_APP_DIR = appDir;
++  });
+   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'computer-use-host-'));
+   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+   const socketPath = path.join(root, 'native.sock');

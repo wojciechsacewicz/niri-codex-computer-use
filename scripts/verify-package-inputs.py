@@ -20,5 +20,10 @@ for suite, fixture, binaries in [
     for name in dependencies:
         actual = hashlib.sha256((root / 'tests' / name).read_bytes()).hexdigest()
         assert result['test_sha256'][name] == actual, f'{name} changed since {suite} checks'
+    if suite == 'backend':
+        api = root / 'build/codex-desktop-linux/linux-features/computer-use-linux'
+        for name in ['native-client.mjs', 'native-protocol.mjs', 'native-backend-service.mjs']:
+            actual = hashlib.sha256((api / name).read_bytes()).hexdigest()
+            assert result.get('api_sha256', {}).get(name) == actual, f'{name} changed since native API checks'
     assert (directory / 'agent-cursor-screen.png').is_file(), f'{suite} cursor evidence missing'
 print('Both native checks passed for the exact packaged binaries and test sources.')

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ $# == 0 ]] || { echo 'This command takes no arguments' >&2; exit 2; }
-for command in Xvfb xauth xdotool wtype wl-copy wl-paste bwrap dbus-daemon; do
+for command in Xvfb xauth xdotool wtype wl-copy wl-paste bwrap dbus-daemon node; do
     command -v "$command" >/dev/null || { echo "Missing native test dependency: $command" >&2; exit 1; }
 done
 "${NCCU_PYTHON:-python3}" - <<'PY'

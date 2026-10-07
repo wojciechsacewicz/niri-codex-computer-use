@@ -57,7 +57,7 @@ try:
     for key in ['WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'NIRI_SOCKET', 'DBUS_SESSION_BUS_ADDRESS', 'MANAGERPID', 'SYSTEMD_EXEC_PID']:
         env.pop(key, None)
     env.update(XDG_RUNTIME_DIR=runtime.name, WINIT_UNIX_BACKEND='x11',
-               LIBGL_ALWAYS_SOFTWARE='1', LP_NUM_THREADS='2', GALLIUM_DRIVER='llvmpipe')
+               GIO_USE_VFS='local', LIBGL_ALWAYS_SOFTWARE='1', LP_NUM_THREADS='2', GALLIUM_DRIVER='llvmpipe')
     display = next(n for n in range(91, 110) if not Path(f'/tmp/.X11-unix/X{n}').exists())
     env['DISPLAY'] = f':{display}'
     auth = Path(runtime.name) / 'Xauthority'
@@ -97,6 +97,9 @@ input {
     }
 }
 ''')
+    theme = os.environ.get('NCCU_TEST_CURSOR_THEME')
+    if theme:
+        config.write_text(config.read_text() + '\ncursor { xcursor-theme ' + json.dumps(theme) + '; xcursor-size 24; }\n')
     subprocess.run([str(args.niri.resolve()), 'validate', '-c', str(config)], env=env,
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
     niri = spawn([str(args.niri.resolve()), '-c', str(config)], env, 'niri')

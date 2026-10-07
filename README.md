@@ -8,7 +8,7 @@ Our goal is computer use on **CachyOS and niri** with a visible agent cursor, in
 
 - **Your cursor stays yours.** Agent input must not move your pointer or change its shape.
 - **You keep your focus.** Typing and clicking in another app must not interrupt your work.
-- **You can see the agent.** A separate marker shows its cursor inside the window it controls.
+- **You can see the agent.** A separate cursor uses your cursor theme with a random agent color. The color stays consistent while that agent works.
 - **Background windows stay in the background.** The agent can work in covered or off-screen windows without bringing them forward.
 - **Updates preserve a working setup.** Compatibility checks should reject a broken update and leave the previous version available for rollback.
 
@@ -16,15 +16,15 @@ If background input is unavailable, we should report that clearly. Quietly takin
 
 ## Current status
 
-This is an early project. Our niri 26.04 build and Codex backend pass isolated GTK tests on CachyOS for clicks, text including Unicode, keys, scroll, drag, and screenshots on another workspace. The human test app keeps its input, pointer position, focus, and clipboard. The purple agent cursor is visible in the target window.
+This is an early project. Our niri 26.04 build and Codex backend pass isolated GTK tests on CachyOS for clicks, text including Unicode, keys, scroll, drag, and screenshots on another workspace. The human test app keeps its input, pointer position, focus, and clipboard. The updated agent cursor reuses the human cursor image with a separate tint.
 
-![Human and agent test windows with a separate purple agent cursor](docs/images/background-cursor.png)
+![Human and agent test windows with separate themed cursors](docs/images/background-cursor.png)
 
-The current Codex SDK checks and two successive update-source snapshots also pass. We have built separate CachyOS packages. A first-login launcher bug was found and fixed. Activation in a real login session and real app testing are still required before calling this ready for daily use.
+The current Codex SDK checks and two successive update-source snapshots also pass. We have built separate CachyOS packages. A first-login launcher bug was found and fixed. A real companion login and native GTK input have now passed. Chromium also passed image-based control with no accessible controls, including fresh screenshots and input on a hidden workspace. Concurrent input to two XWayland apps remains unsupported because they share one Wayland client. This is not ready to promise compatibility with every application. A real session has also ended in a compositor crash. Its cause is still under investigation, so stability is not yet established. The new API and cursor changes are candidates awaiting installation and session validation.
 
 The project stores patches and source pins, not a copy of niri. Source builds fetch the reviewed upstream revision into an ignored build directory. GitHub release updates and a Topgrade drop-in are provided. No stable release is published yet, so the updater leaves the installed version alone.
 
-See [installation](docs/installation.md) for build, test, activation, and rollback steps. See [maintenance](docs/maintenance-cachyos.md) for updates. The original NixOS files remain as reference material.
+See [installation](docs/installation.md) for build, test, activation, and rollback steps. See [maintenance](docs/maintenance-cachyos.md) for updates and [native API compatibility](docs/native-api-compatibility.md) for the tested contract. The original NixOS files remain as reference material.
 
 ## How it works
 
