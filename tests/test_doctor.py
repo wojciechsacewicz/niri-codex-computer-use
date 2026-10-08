@@ -118,12 +118,28 @@ class DoctorTests(unittest.TestCase):
                     self.units[name] = original
 
     def test_correct_service_active_with_wrong_binary_is_error(self):
-        for executable in (doctor.STOCK_NIRI, '/tmp/niri', doctor.PATCHED_NIRI + ' (deleted)'):
+        for executable in (doctor.STOCK_NIRI, '/tmp/niri', doctor.STOCK_NIRI + ' (deleted)', '/tmp/niri (deleted)'):
             with self.subTest(executable=executable):
                 self.executables[42] = executable
                 report = doctor.diagnose(self.system)
                 self.assert_error(report, 'niri-codex.service is active with the wrong binary')
                 self.assertEqual(report['units']['niri-codex.service']['executable'], executable)
+
+    def test_replaced_running_compositor_is_pending_until_relogin(self):
+        self.executables[42] = doctor.PATCHED_NIRI + ' (deleted)'
+        report = doctor.diagnose(self.system)
+        self.assertEqual(report['exit_code'], 2)
+        self.assertEqual(report['status'], 'activation pending')
+        self.assertEqual(report['errors'], [])
+        self.assertTrue(any('previous executable' in reason for reason in report['pending']))
+        self.assertEqual(report['units']['niri-codex.service']['binary'], 'patched')
+        self.executables[42] = doctor.PATCHED_NIRI
+        self.assertEqual(doctor.diagnose(self.system)['exit_code'], 0)
+
+    def test_replaced_running_compositor_does_not_hide_missing_installed_binary(self):
+        self.executables[42] = doctor.PATCHED_NIRI + ' (deleted)'
+        self.missing.add(doctor.PATCHED_NIRI)
+        self.assert_error(doctor.diagnose(self.system), 'Missing installed compositor')
 
     def test_failed_service_is_error(self):
         self.stock_session()

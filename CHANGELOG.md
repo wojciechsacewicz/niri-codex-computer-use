@@ -15,8 +15,9 @@
 - Refuse unsupported X11 Unicode before sending partial text.
 - Re-enter pointer delivery after the agent cursor expires.
 - Add a local public-file guard for private paths, session data, credentials, and image metadata.
+- Report a replaced running compositor as awaiting relogin, rather than a failed installation.
 
-The real companion login, GTK input, and vision-only Chromium control passed. Concurrent input to two XWayland apps remains unsupported. A real session also crashed in the installed compositor; the cause remains under investigation. The new API and cursor changes have not yet been installed or validated in a real session. Cursor changes require activating the updated compositor at the next login.
+The updated companion login and GTK checks through the actual `cua_repl` tool passed, including Unicode, indexed input, dragging, and fresh images on an inactive workspace at 150% scale. Vision-only Chromium control passed earlier. Concurrent input to two XWayland apps remains unsupported. An earlier real session crashed; the cause remains under investigation. These checks do not establish long-term stability. The diagnostic correction is prepared for the next package build. Compositor changes still require activation at the next login.
 
 ## 0.1.1, unreleased
 

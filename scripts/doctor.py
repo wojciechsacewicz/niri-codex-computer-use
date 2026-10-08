@@ -219,8 +219,9 @@ def diagnose(system=None):
         if pid > 0:
             try:
                 entry['executable'] = system.read_exe(pid)
+                entry['replaced_executable'] = entry['executable'].endswith(' (deleted)')
                 entry['binary'] = {STOCK_NIRI: 'stock', PATCHED_NIRI: 'patched'}.get(
-                    entry['executable'], 'unexpected')
+                    entry['executable'].removesuffix(' (deleted)'), 'unexpected')
             except OSError as exc:
                 errors.append(f'Cannot read /proc/{pid}/exe for {unit}: {exc}')
         if entry['ActiveState'] == 'active':
@@ -229,6 +230,9 @@ def diagnose(system=None):
             if pid == 0 or entry['binary'] != expected:
                 errors.append(f'{unit} is active with the wrong binary: '
                               f'{entry["executable"] or "unavailable"}; expected {expected}.')
+            elif entry.get('replaced_executable'):
+                report['pending'].append(f'{unit} is still using its previous executable. '
+                                         'Log out and back in to activate the installed update.')
 
     if len(active) > 1:
         errors.append('Both niri units report active sessions.')
@@ -246,7 +250,8 @@ def diagnose(system=None):
         report['session']['status'] = 'no active session'
         report['pending'].append('The companion session is not active; activation is pending.')
 
-    report['exit_code'] = 1 if errors else (0 if report['session']['status'] == 'patched active' else 2)
+    report['exit_code'] = 1 if errors else (
+        0 if report['session']['status'] == 'patched active' and not report['pending'] else 2)
     report['status'] = {0: 'active ready configuration', 1: 'errors',
                         2: 'activation pending'}[report['exit_code']]
     return report
